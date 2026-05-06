@@ -1,0 +1,567 @@
+"""
+extract.py — Extracción de datos para TechRadar.
+
+Fuentes:
+  - Adzuna API: ofertas IT en 8 países EU zona Euro (paginación automática).
+  - Crawling redirect_url: texto completo de la oferta para NLP.
+  - Eurostat API: tasa de empleo 15-64 años por país y año.
+
+Uso:
+  Importar las funciones desde pipeline.py:
+    from scripts.extract import extract_adzuna, enrich_with_full_descriptions, extract_eurostat
+"""
+
+import logging
+import os
+import time
+from typing import Optional
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("techradar.extract")
+
+load_dotenv()
+
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+
+# Países cubiertos: código ISO → endpoint Adzuna
+# UK excluido: no pertenece a la UE y Eurostat no publica datos de UK post-Brexit.
+# Todos los salarios de estos países están en EUR (sin conversión necesaria).
+ADZUNA_COUNTRIES = {
+    "de": "de",
+    "fr": "fr",
+    "es": "es",
+    "nl": "nl",
+    "pl": "pl",
+    "it": "it",
+    "at": "at",
+    "be": "be",
+}
+
+ADZUNA_BASE_URL = "https://api.adzuna.com/v1/api/jobs"
+ADZUNA_RESULTS_PER_PAGE = 50
+ADZUNA_CATEGORY = "it-jobs"
+
+EUROSTAT_URL = (
+    "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/lfsi_emp_a"
+)
+EUROSTAT_INDICATOR = "employment_rate_15_64"
+
+# Delay entre crawling para respetar los ToS de Adzuna
+CRAWL_DELAY_SECONDS = 2.0
+
+# Delay entre páginas para mantenernos dentro del rate limit de la API
+API_PAGE_DELAY_SECONDS = 0.5
+
+REQUEST_TIMEOUT = 15
+
+CRAWL_USER_AGENT = "TechRadarBot/1.0 (portfolio project; personal research)"
+
+
+# =============================================================================
+# Adzuna API
+# =============================================================================
+
+
+def _build_adzuna_params(page: int, max_days_old: int) -> dict:
+    """
+    Construye los parámetros de query para una petición a la API de Adzuna.
+
+    Args:
+        page (int): Número de página (comienza en 1).
+        max_days_old (int): Antigüedad máxima de las ofertas en días.
+
+    Returns:
+        dict: Parámetros listos para requests.get().
+    """
+    return {
+        "app_id": ADZUNA_APP_ID,
+        "app_key": ADZUNA_APP_KEY,
+        "results_per_page": ADZUNA_RESULTS_PER_PAGE,
+        "category": ADZUNA_CATEGORY,
+        "max_days_old": max_days_old,
+    }
+
+
+def fetch_adzuna_page(
+    session: requests.Session,
+    country_code: str,
+    page: int,
+    max_days_old: int,
+) -> Optional[dict]:
+    """
+    Descarga una página de resultados de la API de Adzuna para un país dado.
+
+    Args:
+        session (requests.Session): Sesión HTTP reutilizable.
+        country_code (str): Código ISO del país (ej: 'es', 'de').
+        page (int): Número de página (comienza en 1).
+        max_days_old (int): Antigüedad máxima de las ofertas en días.
+
+    Returns:
+        dict | None: JSON de respuesta de la API, o None si hubo error.
+    """
+    endpoint = ADZUNA_COUNTRIES.get(country_code)
+    if not endpoint:
+        logger.error("País no soportado: %s", country_code)
+        return None
+
+    url = f"{ADZUNA_BASE_URL}/{endpoint}/search/{page}"
+    params = _build_adzuna_params(page, max_days_old)
+
+    try:
+        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as exc:
+        logger.warning("HTTP error en %s página %d: %s", country_code, page, exc)
+        return None
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Error de red en %s página %d: %s", country_code, page, exc)
+        return None
+
+
+def _parse_job_record(raw_job: dict, country_code: str) -> dict:
+    """
+    Extrae y normaliza los campos relevantes de un registro raw de la API.
+
+    Los 8 países cubiertos usan EUR como moneda, no se necesita conversión.
+
+    Args:
+        raw_job (dict): Registro tal como llega de la API de Adzuna.
+        country_code (str): Código ISO del país de la oferta.
+
+    Returns:
+        dict: Registro normalizado listo para construir el DataFrame.
+    """
+    # El último elemento del área geográfica suele ser la ciudad más específica
+    location_area = raw_job.get("location", {}).get("area", [])
+    city = location_area[-1] if location_area else None
+
+    return {
+        "id": int(raw_job.get("id", 0)),
+        "source": "adzuna",
+        "title": raw_job.get("title", "").strip(),
+        "company": raw_job.get("company", {}).get("display_name", None),
+        "location_display": raw_job.get("location", {}).get("display_name", None),
+        "city": city,
+        "country_code": country_code,
+        "salary_min": _safe_int(raw_job.get("salary_min")),
+        "salary_max": _safe_int(raw_job.get("salary_max")),
+        # El campo llega como string "0" o "1" en la respuesta de la API
+        "salary_is_predicted": str(raw_job.get("salary_is_predicted", "0")) == "1",
+        "contract_type": raw_job.get("contract_type", None),
+        "contract_time": raw_job.get("contract_time", None),
+        # Descripción corta (500 chars truncados) y URL para crawling posterior
+        "description_short": raw_job.get("description", None),
+        "description_full": None,
+        "url": raw_job.get("redirect_url", None),
+        "posted_at": raw_job.get("created", None),
+    }
+
+
+def _safe_int(value) -> Optional[int]:
+    """
+    Convierte un valor a entero de forma segura.
+
+    Args:
+        value: Valor a convertir (puede ser float, str, None...).
+
+    Returns:
+        int | None: Entero convertido, o None si el valor es nulo o inválido.
+    """
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_all_jobs_for_country(
+    session: requests.Session,
+    country_code: str,
+    max_days_old: int,
+) -> list[dict]:
+    """
+    Descarga todas las páginas disponibles de ofertas IT para un país.
+
+    Para en cuanto la API devuelve una página vacía o se alcanza el límite
+    práctico de resultados (Adzuna limita la paginación a 5.000 resultados
+    por categoría en el plan gratuito).
+
+    Args:
+        session (requests.Session): Sesión HTTP reutilizable.
+        country_code (str): Código ISO del país.
+        max_days_old (int): Antigüedad máxima en días.
+
+    Returns:
+        list[dict]: Lista de registros normalizados de ese país.
+    """
+    all_jobs = []
+    page = 1
+    max_pages = 100  # 100 páginas × 50 resultados = 5.000 registros máximo
+
+    logger.info("Extrayendo [%s] ...", country_code)
+
+    while page <= max_pages:
+        raw_response = fetch_adzuna_page(session, country_code, page, max_days_old)
+
+        if raw_response is None:
+            break
+
+        raw_jobs = raw_response.get("results", [])
+
+        if not raw_jobs:
+            break
+
+        for raw_job in raw_jobs:
+            parsed = _parse_job_record(raw_job, country_code)
+            all_jobs.append(parsed)
+
+        logger.info(
+            "  [%s] página %d → %d ofertas acumuladas",
+            country_code, page, len(all_jobs),
+        )
+
+        page += 1
+        time.sleep(API_PAGE_DELAY_SECONDS)
+
+    logger.info("  [%s] total: %d ofertas", country_code, len(all_jobs))
+    return all_jobs
+
+
+def extract_adzuna(max_days_old: int = 7) -> pd.DataFrame:
+    """
+    Extrae todas las ofertas IT de Adzuna para los 8 países EU (zona Euro).
+
+    Hace paginación automática por cada país. Todos los salarios están
+    ya en EUR (moneda única de los 8 países cubiertos).
+
+    Args:
+        max_days_old (int): Antigüedad máxima de las ofertas en días.
+                            Usa 7 para cargas incrementales semanales.
+                            Usa 30 para la carga inicial completa.
+
+    Returns:
+        pd.DataFrame: DataFrame con una fila por oferta y las columnas
+                      definidas en _parse_job_record().
+    """
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+        raise EnvironmentError(
+            "Variables de entorno ADZUNA_APP_ID y ADZUNA_APP_KEY no configuradas. "
+            "Copia .env.example a .env y rellena tus credenciales."
+        )
+
+    all_jobs = []
+
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": CRAWL_USER_AGENT})
+
+        for country_code in ADZUNA_COUNTRIES:
+            country_jobs = fetch_all_jobs_for_country(
+                session, country_code, max_days_old
+            )
+            all_jobs.extend(country_jobs)
+
+    if not all_jobs:
+        logger.warning("extract_adzuna: no se obtuvieron ofertas. Verificar credenciales.")
+        return pd.DataFrame()
+
+    raw_jobs_df = pd.DataFrame(all_jobs)
+
+    raw_jobs_df["posted_at"] = pd.to_datetime(
+        raw_jobs_df["posted_at"], utc=True, errors="coerce"
+    )
+
+    logger.info(
+        "extract_adzuna completado: %d ofertas totales de %d países",
+        len(raw_jobs_df),
+        raw_jobs_df["country_code"].nunique(),
+    )
+
+    return raw_jobs_df
+
+
+# =============================================================================
+# Crawling de redirect_url para description_full
+# =============================================================================
+
+
+def crawl_description(session: requests.Session, url: str) -> Optional[str]:
+    """
+    Descarga la página de una oferta en www.adzuna.es y extrae el texto
+    completo de la descripción.
+
+    El redirect_url apunta directamente al dominio de Adzuna (no al anunciante),
+    por lo que no hay protección anti-bot. El crawling está autorizado por los
+    ToS de Adzuna para uso de investigación personal.
+
+    Args:
+        session (requests.Session): Sesión HTTP con User-Agent configurado.
+        url (str): redirect_url de la oferta (campo de la API).
+
+    Returns:
+        str | None: Texto limpio de la descripción completa, o None si falló.
+    """
+    if not url:
+        return None
+
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.debug("Crawling fallido para %s: %s", url, exc)
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Selectores por orden de preferencia (el DOM varía entre ofertas y países)
+    description_text = None
+
+    for selector in [
+        "section.adp-body",
+        "div.adp-body",
+        "[data-automation='jobDescription']",
+        "div.jobDescription",
+        "div#job-description",
+        "article",
+    ]:
+        element = soup.select_one(selector)
+        if element:
+            description_text = element.get_text(separator="\n", strip=True)
+            break
+
+    # Fallback al body completo si ningún selector encaja
+    if not description_text:
+        body = soup.find("body")
+        if body:
+            description_text = body.get_text(separator="\n", strip=True)
+
+    # Eliminar líneas vacías consecutivas
+    if description_text:
+        lines = [line for line in description_text.splitlines() if line.strip()]
+        description_text = "\n".join(lines)
+
+    return description_text if description_text else None
+
+
+def enrich_with_full_descriptions(
+    raw_jobs_df: pd.DataFrame,
+    crawl_delay: float = CRAWL_DELAY_SECONDS,
+) -> pd.DataFrame:
+    """
+    Enriquece el DataFrame de ofertas con el texto completo de cada oferta
+    obtenido via crawling del redirect_url.
+
+    Las ofertas donde el crawling falle mantendrán description_full = None.
+    El pipeline usa description_short como fallback en esos casos.
+
+    Args:
+        raw_jobs_df (pd.DataFrame): DataFrame de salida de extract_adzuna().
+        crawl_delay (float): Segundos de pausa entre peticiones de crawling.
+                             Por defecto 2.0 para respetar el servidor.
+
+    Returns:
+        pd.DataFrame: Mismo DataFrame con la columna description_full rellena
+                      donde el crawling fue exitoso.
+    """
+    if raw_jobs_df.empty:
+        return raw_jobs_df
+
+    enriched_df = raw_jobs_df.copy()
+    total = len(enriched_df)
+    success_count = 0
+
+    logger.info("Iniciando crawling de %d ofertas (delay=%.1fs)...", total, crawl_delay)
+
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": CRAWL_USER_AGENT})
+
+        for idx, row in enriched_df.iterrows():
+            url = row.get("url")
+
+            if not url:
+                continue
+
+            full_text = crawl_description(session, url)
+
+            if full_text:
+                enriched_df.at[idx, "description_full"] = full_text
+                success_count += 1
+            else:
+                logger.debug("Sin descripción completa para job_id=%s", row.get("id"))
+
+            current_pos = enriched_df.index.get_loc(idx) + 1
+            if current_pos % 50 == 0:
+                logger.info(
+                    "  Crawling: %d/%d procesadas (%d con éxito)",
+                    current_pos, total, success_count,
+                )
+
+            time.sleep(crawl_delay)
+
+    success_rate = (success_count / total * 100) if total > 0 else 0
+    logger.info(
+        "Crawling completado: %d/%d exitosas (%.1f%%)",
+        success_count, total, success_rate,
+    )
+
+    return enriched_df
+
+
+# =============================================================================
+# Eurostat API
+# =============================================================================
+
+
+def _parse_eurostat_response(response_json: dict) -> list[dict]:
+    """
+    Parsea la respuesta SDMX-JSON de Eurostat y la convierte en una lista
+    de registros planos {country_code, year, indicator, value}.
+
+    La API de Eurostat devuelve un array multidimensional comprimido donde
+    los valores se indexan por su posición en el espacio dimensional.
+
+    Args:
+        response_json (dict): JSON tal como devuelve la API de Eurostat.
+
+    Returns:
+        list[dict]: Lista de registros con country_code, year, indicator, value.
+    """
+    dimension_order = response_json.get("id", [])
+    dimensions = response_json.get("dimension", {})
+    values = response_json.get("value", {})
+    sizes = response_json.get("size", [])
+
+    if not dimension_order or not values:
+        logger.warning("Respuesta de Eurostat vacía o malformada")
+        return []
+
+    # Construir diccionarios posición → etiqueta para cada dimensión
+    # La API devuelve {"AT": 0, "BE": 1, ...} y necesitamos el inverso
+    dim_labels = {}
+    for dim_name in dimension_order:
+        dim_info = dimensions.get(dim_name, {})
+        category = dim_info.get("category", {})
+        dim_labels[dim_name] = {
+            pos: label
+            for label, pos in category.get("index", {}).items()
+        }
+
+    # Calcular multiplicadores para reconstruir índices dimensionales desde el índice plano
+    # Ej: sizes = [1, 1, 1, 1, 1, 9, 5] → multiplicador de la última dimensión es 1
+    multipliers = []
+    for i in range(len(sizes)):
+        mult = 1
+        for j in range(i + 1, len(sizes)):
+            mult *= sizes[j]
+        multipliers.append(mult)
+
+    records = []
+
+    for flat_idx_str, value in values.items():
+        if value is None:
+            continue
+
+        flat_idx = int(flat_idx_str)
+
+        remaining = flat_idx
+        dim_indices = {}
+        for i, dim_name in enumerate(dimension_order):
+            dim_idx = remaining // multipliers[i]
+            remaining = remaining % multipliers[i]
+            dim_indices[dim_name] = dim_idx
+
+        geo_code = dim_labels.get("geo", {}).get(dim_indices.get("geo"), None)
+        year_str = dim_labels.get("time", {}).get(dim_indices.get("time"), None)
+
+        if not geo_code or not year_str:
+            continue
+
+        records.append({
+            "country_code": geo_code.lower(),
+            "year": int(year_str),
+            "indicator": EUROSTAT_INDICATOR,
+            "value": float(value),
+        })
+
+    return records
+
+
+def extract_eurostat(since_year: int = 2019) -> pd.DataFrame:
+    """
+    Descarga la tasa de empleo 15-64 años por país desde la API de Eurostat.
+
+    Cubre los 8 países del proyecto (DE, FR, ES, NL, PL, IT, AT, BE)
+    desde el año indicado hasta el más reciente disponible.
+
+    Dataset: lfsi_emp_a — licencia CC BY 4.0. No requiere autenticación.
+
+    Args:
+        since_year (int): Año mínimo a incluir. Por defecto 2019.
+
+    Returns:
+        pd.DataFrame: DataFrame con columnas country_code, year, indicator, value.
+                      Listo para cargarse en la tabla labor_market_context.
+    """
+    # UK no forma parte del proyecto (ni de la UE ni de Eurostat post-Brexit)
+    eurostat_geo_codes = ["DE", "FR", "ES", "NL", "PL", "IT", "AT", "BE"]
+
+    params = {
+        "geo": eurostat_geo_codes,
+        "sex": "T",            # Total (hombres + mujeres)
+        "age": "Y15-64",       # Franja de edad laboral estándar
+        "unit": "PC_POP",      # Porcentaje de población
+        "indic_em": "EMP_LFS", # Employment Labour Force Survey
+        "sinceTimePeriod": str(since_year),
+    }
+
+    logger.info("Descargando datos de Eurostat (desde %d)...", since_year)
+
+    try:
+        response = requests.get(
+            EUROSTAT_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        response_json = response.json()
+    except requests.exceptions.RequestException as exc:
+        logger.error("Error descargando Eurostat: %s", exc)
+        return pd.DataFrame()
+
+    records = _parse_eurostat_response(response_json)
+
+    if not records:
+        logger.warning("extract_eurostat: no se obtuvieron datos.")
+        return pd.DataFrame()
+
+    eurostat_df = pd.DataFrame(records)
+
+    # Filtrar solo los países que cubre el proyecto
+    valid_countries = set(ADZUNA_COUNTRIES.keys())
+    eurostat_df = eurostat_df[eurostat_df["country_code"].isin(valid_countries)]
+
+    eurostat_df["year"] = eurostat_df["year"].astype("Int16")
+    eurostat_df["value"] = eurostat_df["value"].round(2)
+
+    logger.info(
+        "extract_eurostat completado: %d registros (%d países, años %d–%d)",
+        len(eurostat_df),
+        eurostat_df["country_code"].nunique(),
+        eurostat_df["year"].min(),
+        eurostat_df["year"].max(),
+    )
+
+    return eurostat_df
