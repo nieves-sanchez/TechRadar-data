@@ -1,0 +1,47 @@
+{
+  "dataset": "lfsi_emp_a",
+  "description": "Tasa de empleo 15-64 años por país (2023)",
+  "source": "Eurostat REST API",
+  "use_case": "Datos contextuales del mercado laboral — NO ofertas de trabajo",
+  "records": [
+    {
+      "country_code": "Germany",
+      "year": "2023",
+      "indicator": "Employment rate 15-64 (% population)",
+      "value": 77.3
+    },
+    {
+      "country_code": "Spain",
+      "year": "2023",
+      "indicator": "Employment rate 15-64 (% population)",
+      "value": 65.3
+    },
+    {
+      "country_code": "France",
+      "year": "2023",
+      "indicator": "Employment rate 15-64 (% population)",
+      "value": 68.4
+    },
+    {
+      "country_code": "Netherlands",
+      "year": "2023",
+      "indicator": "Employment rate 15-64 (% population)",
+      "value": 82.4
+    },
+    {
+      "country_code": "Poland",
+      "year": "2023",
+      "indicator": "Employment rate 15-64 (% population)",
+      "value": 72.4
+    }
+  ],
+  "raw_dimensions": [
+    "freq",
+    "indic_em",
+    "sex",
+    "age",
+    "unit",
+    "geo",
+    "time"
+  ]
+}

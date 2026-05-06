@@ -1,0 +1,156 @@
+{
+  "results": [
+    {
+      "longitude": 13.420806,
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJpIjoiNTcxOTUyODYyOCIsInMiOiJ6ckFJTHI1SThSR3NMTlpGRlRvcDZnIn0.ed5N97mmmiutfcgSl2k-9XqC_9EkNIJCuH-nQ5_2y8c",
+      "company": {
+        "display_name": "N26 GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "created": "2026-05-05T16:42:32Z",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "salary_is_predicted": "0",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "description": "About the opportunity We are seeking a Data Engineer to join the Data Experience Team within the Platform Engineering Domain. Platform Engineering's mission is to provide trusted, performant, and self-service platforms, enabling product teams to build 'the bank the world loves to use.' As part of this, this team is responsible for architecting and operating highly scalable, secure and compliant infrastructure solutions that manage our core database offering and data storage capabilities. The id…",
+      "category": {
+        "tag": "unknown",
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "latitude": 52.507706,
+      "redirect_url": "https://www.adzuna.de/land/ad/5719528628?se=zrAILr5I8RGsLNZFFTop6g&utm_medium=api&utm_source=fcf1751a&v=1112723150671C1369CA81C455A0A192A1C59B22",
+      "id": "5719528628",
+      "title": "Data Engineer - Platform Engineering"
+    },
+    {
+      "title": "Customer Data Engineer (w/m/d)",
+      "redirect_url": "https://www.adzuna.de/land/ad/5717126194?se=zrAILr5I8RGsLNZFFTop6g&utm_medium=api&utm_source=fcf1751a&v=2164999CCFA2788D36CFFAC9105B52DE9663D835",
+      "id": "5717126194",
+      "company": {
+        "display_name": "MAINGAU Energie GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJpIjoiNTcxNzEyNjE5NCIsInMiOiJ6ckFJTHI1SThSR3NMTlpGRlRvcDZnIn0.BfFSZz-uAcQOSjP9_1hy0wTEPWcFkysxoYTTs9FjBJA",
+      "longitude": 8.86518,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "salary_is_predicted": "0",
+      "created": "2026-05-02T16:51:20Z",
+      "latitude": 50.08229,
+      "description": "Wir sind MAINGAU – ein ambitioniertes Energie- und Techunternehmen mit klarem Fokus auf technologiegetriebene Lösungen für die Energiewelt von morgen. Mehr als 1.000.000 Kundenbeziehungen europaweit und ein Umsatz von 1,3 Milliarden Euro in 2024 machen uns zu einem der am schnellsten wachsenden Energieunternehmen Deutschlands. Neben dem Strom- und Gasvertrieb bieten wir vielfältige Produkte in den Bereichen E-Mobilität, Internet und Mobilfunk und betreiben einen Onlineshop. An unserem Standort …",
+      "location": {
+        "display_name": "Obertshausen, Offenbach (Kreis)",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Hessen",
+          "Offenbach (Kreis)",
+          "Obertshausen"
+        ]
+      },
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown",
+        "tag": "unknown"
+      }
+    },
+    {
+      "title": "Senior Data Engineer (w/m/d)",
+      "id": "5717900912",
+      "redirect_url": "https://www.adzuna.de/land/ad/5717900912?se=zrAILr5I8RGsLNZFFTop6g&utm_medium=api&utm_source=fcf1751a&v=7A5F03A491A44170EA115B84EA5C94EF2D6ABDF8",
+      "latitude": 49.25278,
+      "category": {
+        "tag": "unknown",
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "description": "Wir sind Deutschlands führender Entwickler und Betreiber von Thermen und Badewelten. Unsere rd. 500 MitarbeiterInnen betreuen unsere Gäste persönlich an unseren drei Wellnessstandorten oder steuern in unseren übergreifenden Kompetenzcentern unsere gruppenweiten Prozesse. Was uns alle verbindet: Teamgeist, Offenheit und der Mut, Neues zu wagen. Vielfalt und soziale Verantwortung sind dabei Teil unserer DNA. Wir lieben und leben, was wir tun. Und diese Begeisterung spüren unsere Gäste. Unsere Hol…",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Baden-Württemberg",
+          "Rhein-Neckar-Kreis",
+          "Sinsheim"
+        ],
+        "display_name": "Sinsheim, Rhein-Neckar-Kreis",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "salary_is_predicted": "0",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-05-03T16:41:30Z",
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJpIjoiNTcxNzkwMDkxMiIsInMiOiJ6ckFJTHI1SThSR3NMTlpGRlRvcDZnIn0.QmYJnEG5YCyFDXKKS6wOUKV4uUffZUxWPqahe5hIMK4",
+      "longitude": 8.87944,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "WUND HOLDING GmbH"
+      }
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-05-04T16:49:03Z",
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "WUND HOLDING GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJzIjoienJBSUxyNUk4UkdzTE5aRkZUb3A2ZyIsImkiOiI1NzE4NjMyNjA3In0.lnUQlSYQwd9aFx29ieKyjc7TxHG68sbffE4ijOu0ZSk",
+      "longitude": 6.805964,
+      "latitude": 50.649684,
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown",
+        "tag": "unknown"
+      },
+      "description": "Wir sind Deutschlands führender Entwickler und Betreiber von Thermen und Badewelten. Unsere rd. 500 MitarbeiterInnen betreuen unsere Gäste persönlich an unseren drei Wellnessstandorten oder steuern in unseren übergreifenden Kompetenzcentern unsere gruppenweiten Prozesse. Was uns alle verbindet: Teamgeist, Offenheit und der Mut, Neues zu wagen. Vielfalt und soziale Verantwortung sind dabei Teil unserer DNA. Wir lieben und leben, was wir tun. Und diese Begeisterung spüren unsere Gäste. Unsere Hol…",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Euskirchen, Euskirchen (Kreis)",
+        "area": [
+          "Deutschland",
+          "Nordrhein-Westfalen",
+          "Euskirchen (Kreis)",
+          "Euskirchen"
+        ]
+      },
+      "title": "Senior Data Engineer (m/w/d)",
+      "id": "5718632607",
+      "redirect_url": "https://www.adzuna.de/land/ad/5718632607?se=zrAILr5I8RGsLNZFFTop6g&utm_medium=api&utm_source=fcf1751a&v=9A1ED1222E629016E0610D1B2C541445912F1EF3"
+    },
+    {
+      "category": {
+        "label": "Unknown",
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "location": {
+        "area": [
+          "Deutschland",
+          "Nordrhein-Westfalen",
+          "Düsseldorf"
+        ],
+        "display_name": "Düsseldorf, Nordrhein-Westfalen",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "description": "adesso steht für digitale Exzellenz – und damit auch für vielfältige Entwicklungsmöglichkeiten für alle adessi. Wir wachsen gemeinsam und lernen voneinander: in anspruchsvollen Projekten, interdisziplinären Teams und mit zielgerichteten Trainingsangeboten. Wir haben IT im Herzen und den Erfolg unserer Kunden im Fokus. Als Treiber der KI-Transformation verbinden wir Mut zur Veränderung mit technologischer Expertise und zukunftsfähigen Strategien. Was uns stark macht, sind unsere adessi, die etwa…",
+      "latitude": 51.226802,
+      "salary_is_predicted": "0",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-04-27T16:37:42Z",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "adesso SE"
+      },
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJpIjoiNTcxMTg0Nzg0MiIsInMiOiJ6ckFJTHI1SThSR3NMTlpGRlRvcDZnIn0.RNt-TTRreAu_ZT63wcpzpz60GqI0E-jVZMRKmiggdd4",
+      "longitude": 6.808387,
+      "id": "5711847842",
+      "redirect_url": "https://www.adzuna.de/land/ad/5711847842?se=zrAILr5I8RGsLNZFFTop6g&utm_medium=api&utm_source=fcf1751a&v=1B2558AA0237A611F6AC0C6780143D832404529F",
+      "title": "Snowflake Data Engineer (all genders)"
+    }
+  ]
+}
