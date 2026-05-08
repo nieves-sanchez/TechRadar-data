@@ -1,5 +1,5 @@
 """
-transform.py — Transformación y enriquecimiento de datos para TechRadar.
+transform.py — Transformación, validación y enriquecimiento de datos para TechRadar.
 
 Recibe los DataFrames crudos de extract.py y produce DataFrames limpios
 listos para cargar en PostgreSQL.
@@ -32,9 +32,10 @@ _SKILLS_COMPILED = [
 _REMOTE_POS_COMPILED = [re.compile(p, re.IGNORECASE) for p in REMOTE_POSITIVE]
 _REMOTE_NEG_COMPILED = [re.compile(p, re.IGNORECASE) for p in REMOTE_NEGATIVE]
 
-# Conjuntos para validación rápida contra los valores del schema
+# Vocabulario válido según el schema
 _VALID_CONTRACT_TYPES = {"permanent", "contract"}
-_VALID_CONTRACT_TIMES = {"full_time", "part_time"}
+_VALID_CONTRACT_TIMES  = {"full_time", "part_time"}
+_VALID_COUNTRIES       = {"de", "fr", "es", "nl", "pl", "it", "at", "be"}
 
 
 # =============================================================================
@@ -42,9 +43,23 @@ _VALID_CONTRACT_TIMES = {"full_time", "part_time"}
 # =============================================================================
 
 
+def _is_missing(value) -> bool:
+    """Devuelve True si el valor es None, NaN o cualquier tipo de NA de pandas."""
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _normalize_string(value) -> Optional[str]:
-    """Limpia un string: strip, colapsa espacios internos, None si vacío."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    """
+    Limpia un string: strip, colapsa espacios internos, None si vacío.
+
+    Maneja correctamente None, float NaN y pd.NA.
+    """
+    if _is_missing(value):
         return None
     s = re.sub(r"\s+", " ", str(value).strip())
     return s or None
@@ -92,11 +107,15 @@ def _compute_salary_mid(salary_min, salary_max) -> Optional[int]:
 
     Se persiste en la tabla jobs como campo de referencia para el dashboard.
     Los agregados del dashboard usan la mediana de este campo, no la media.
+    Devuelve None si alguno de los dos extremos falta o no es numérico.
     """
-    if salary_min is None or salary_max is None:
+    if _is_missing(salary_min) or _is_missing(salary_max):
         return None
     try:
-        return round((float(salary_min) + float(salary_max)) / 2)
+        mid = (float(salary_min) + float(salary_max)) / 2
+        if pd.isna(mid):
+            return None
+        return round(mid)
     except (TypeError, ValueError):
         return None
 
@@ -110,16 +129,19 @@ def _detect_remote(
     Detecta si la oferta es remota a partir del texto disponible.
 
     Busca primero señales positivas (remoto explícito); si no las hay, busca
-    señales negativas (presencial explícito). Si no hay señal clara, devuelve None.
+    señales negativas (presencial explícito). Si no hay señal clara devuelve None.
 
     Returns:
         True  — la oferta menciona explícitamente trabajo remoto.
         False — la oferta menciona explícitamente trabajo presencial.
         None  — sin señal suficiente para determinarlo.
     """
-    combined = " ".join(filter(None, [title, description, location]))
-    if not combined:
+    # Filtrar explícitamente strings válidos para evitar que NaN o pd.NA
+    # se conviertan en la cadena "nan" y contaminen el texto de búsqueda.
+    parts = [x for x in (title, description, location) if isinstance(x, str) and x.strip()]
+    if not parts:
         return None
+    combined = " ".join(parts)
     if any(p.search(combined) for p in _REMOTE_POS_COMPILED):
         return True
     if any(p.search(combined) for p in _REMOTE_NEG_COMPILED):
@@ -132,10 +154,10 @@ def _classify_role(title: Optional[str]) -> Optional[str]:
     Asigna una categoría de rol a partir del título de la oferta.
 
     Evalúa las categorías en orden de especificidad (de más a menos específico)
-    y devuelve la primera coincidencia. Devuelve 'other' si el título no encaja
-    en ninguna categoría conocida, y None si no hay título.
+    y devuelve la primera coincidencia. Devuelve 'other' si el título existe pero
+    no encaja en ninguna categoría conocida, y None si no hay título.
     """
-    if not title:
+    if not title or not isinstance(title, str):
         return None
     title_lower = title.lower()
     for category, keywords in ROLE_KEYWORDS.items():
@@ -157,7 +179,7 @@ def _extract_skills(text: Optional[str]) -> list[dict]:
     Returns:
         list[dict]: Lista de {"name": ..., "category": ...} por skill encontrada.
     """
-    if not text:
+    if not text or not isinstance(text, str):
         return []
     found = []
     seen: set[str] = set()
@@ -170,6 +192,64 @@ def _extract_skills(text: Optional[str]) -> list[dict]:
     return found
 
 
+def _validate_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Elimina filas que incumplirían constraints del schema al cargarse en la BD.
+
+    Criterios de rechazo (en orden):
+      1. id nulo o igual a 0 — viola la PRIMARY KEY
+      2. title nulo o vacío — campo NOT NULL en el schema
+      3. country_code no reconocido — viola la FOREIGN KEY a countries
+      4. id duplicado dentro del mismo batch — se conserva la primera aparición
+
+    Todos los descartes se registran en el log con el motivo y el recuento.
+
+    Returns:
+        DataFrame limpio y sin duplicados, con el índice reseteado.
+    """
+    initial = len(df)
+
+    # 1. id válido
+    mask_bad_id = df["id"].apply(_is_missing) | (df["id"] == 0)
+    if mask_bad_id.any():
+        logger.warning("Descartando %d filas sin id válido.", mask_bad_id.sum())
+        df = df[~mask_bad_id].copy()
+
+    # 2. title no nulo
+    mask_no_title = df["title"].apply(_is_missing) | (df["title"].str.strip() == "")
+    if mask_no_title.any():
+        logger.warning("Descartando %d filas sin title.", mask_no_title.sum())
+        df = df[~mask_no_title].copy()
+
+    # 3. country_code reconocido
+    if "country_code" in df.columns:
+        mask_bad_country = ~df["country_code"].isin(_VALID_COUNTRIES)
+        if mask_bad_country.any():
+            bad = df.loc[mask_bad_country, "country_code"].unique().tolist()
+            logger.warning(
+                "Descartando %d filas con country_code inválido: %s",
+                mask_bad_country.sum(), bad,
+            )
+            df = df[~mask_bad_country].copy()
+
+    # 4. Deduplicar por id dentro del batch
+    dupes = df.duplicated(subset=["id"], keep="first")
+    if dupes.any():
+        logger.warning("Eliminando %d ids duplicados en el batch.", dupes.sum())
+        df = df[~dupes].copy()
+
+    discarded = initial - len(df)
+    if discarded > 0:
+        logger.info(
+            "Validación: %d/%d filas conservadas (%d descartadas).",
+            len(df), initial, discarded,
+        )
+    else:
+        logger.info("Validación: todas las %d filas superaron los controles.", initial)
+
+    return df.reset_index(drop=True)
+
+
 # =============================================================================
 # Funciones públicas
 # =============================================================================
@@ -179,15 +259,16 @@ def transform_jobs(
     raw_jobs_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Limpia y enriquece el DataFrame de ofertas de Adzuna.
+    Limpia, valida y enriquece el DataFrame de ofertas de Adzuna.
 
-    Transformaciones aplicadas:
-      - Normalización de strings (title, company, location, city)
-      - Normalización de contract_type y contract_time al vocabulario del schema
-      - Cálculo de salary_mid = round((salary_min + salary_max) / 2)
-      - Detección de remote a partir de título, descripción y ubicación
-      - Clasificación de role_category por palabras clave en el título
-      - Extracción de skills por regex sobre description_full (fallback: description_short)
+    Pasos en orden:
+      1. Normalización de strings (title, company, location, city)
+      2. Validación y descarte de filas inválidas (_validate_jobs)
+      3. Normalización de contract_type y contract_time
+      4. Cálculo de salary_mid = round((salary_min + salary_max) / 2)
+      5. Detección de remote (título, descripción, ubicación)
+      6. Clasificación de role_category (palabras clave en el título)
+      7. Extracción de skills (NLP sobre title + description_full/short)
 
     Args:
         raw_jobs_df: DataFrame de salida de extract_adzuna().
@@ -195,7 +276,7 @@ def transform_jobs(
     Returns:
         jobs_df:       DataFrame con los campos de la tabla jobs, listo para UPSERT.
         job_skills_df: DataFrame con columnas (job_id, skill_name, skill_category).
-                       load.py se encarga de resolver los skill_id contra la tabla skills.
+                       load.py resuelve los skill_id contra la tabla skills.
     """
     if raw_jobs_df.empty:
         logger.warning("transform_jobs: DataFrame de entrada vacío.")
@@ -205,24 +286,32 @@ def transform_jobs(
 
     df = raw_jobs_df.copy()
 
-    # Normalización de strings
+    # 1. Normalización de strings
     for col in ("title", "company", "location_display", "city"):
         if col in df.columns:
             df[col] = df[col].apply(_normalize_string)
 
-    # Contratos
+    # 2. Validación — descarta filas que romperían constraints del schema
+    df = _validate_jobs(df)
+    if df.empty:
+        logger.error("transform_jobs: ninguna fila superó la validación.")
+        return pd.DataFrame(), pd.DataFrame(
+            columns=["job_id", "skill_name", "skill_category"]
+        )
+
+    # 3. Contratos
     if "contract_type" in df.columns:
         df["contract_type"] = df["contract_type"].apply(_normalize_contract_type)
     if "contract_time" in df.columns:
         df["contract_time"] = df["contract_time"].apply(_normalize_contract_time)
 
-    # Salary mid
+    # 4. Salary mid
     df["salary_mid"] = df.apply(
         lambda r: _compute_salary_mid(r.get("salary_min"), r.get("salary_max")),
         axis=1,
     )
 
-    # Remote
+    # 5. Remote
     df["remote"] = df.apply(
         lambda r: _detect_remote(
             r.get("title"),
@@ -232,18 +321,19 @@ def transform_jobs(
         axis=1,
     )
 
-    # Role category
+    # 6. Role category
     df["role_category"] = df["title"].apply(_classify_role)
 
-    # Extracción de skills
+    # 7. Extracción de skills
     skill_records = []
     for _, row in df.iterrows():
         # Concatenar título y descripción para maximizar la señal de NLP.
         # description_full tiene preferencia sobre description_short.
-        text = " ".join(filter(None, [
-            row.get("title") or "",
-            row.get("description_full") or row.get("description_short") or "",
-        ]))
+        parts = [row.get("title") or ""]
+        desc = row.get("description_full") or row.get("description_short") or ""
+        parts.append(desc)
+        text = " ".join(p for p in parts if isinstance(p, str) and p.strip())
+
         for skill in _extract_skills(text):
             skill_records.append({
                 "job_id":         row["id"],
@@ -269,7 +359,7 @@ def transform_jobs(
 
     skills_per_job = len(job_skills_df) / len(jobs_df) if len(jobs_df) > 0 else 0
     logger.info(
-        "transform_jobs: %d ofertas procesadas, %d skills detectadas (%.1f de media por oferta)",
+        "transform_jobs: %d ofertas listas, %d skills detectadas (%.1f de media por oferta)",
         len(jobs_df),
         len(job_skills_df),
         skills_per_job,
@@ -296,6 +386,10 @@ def transform_eurostat(raw_df: pd.DataFrame) -> pd.DataFrame:
         return raw_df
 
     df = raw_df.dropna(subset=["country_code", "year", "value"]).copy()
+
+    # Filtrar solo los países del proyecto por si Eurostat devolviera extras
+    df = df[df["country_code"].isin(_VALID_COUNTRIES)].copy()
+
     df["value"] = df["value"].round(2)
 
     logger.info("transform_eurostat: %d registros procesados.", len(df))

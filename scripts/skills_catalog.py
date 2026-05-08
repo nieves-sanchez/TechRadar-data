@@ -102,7 +102,10 @@ SKILLS: list[tuple[str, str, list[str]]] = [
     ("MLflow",         "tool", [r"\bmlflow\b"]),
     ("Kafka",          "tool", [r"\bkafka\b", r"\bapache\s+kafka\b"]),
     ("Git",            "tool", [r"\bgit\b"]),
+    # GitHub Actions se detecta antes que GitHub para evitar doble match
     ("GitHub Actions", "tool", [r"\bgithub\s+actions\b"]),
+    ("GitHub",         "tool", [r"\bgithub\b"]),
+    ("GitLab",         "tool", [r"\bgitlab\b"]),
     ("Jenkins",        "tool", [r"\bjenkins\b"]),
     ("Power BI",       "tool", [r"\bpower\s*bi\b"]),
     ("Tableau",        "tool", [r"\btableau\b"]),
