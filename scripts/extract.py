@@ -14,6 +14,7 @@ Uso:
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -21,12 +22,14 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# Configuración de logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+try:
+    import trafilatura
+    _TRAFILATURA_AVAILABLE = True
+except ImportError:
+    _TRAFILATURA_AVAILABLE = False
+
+# Los módulos subordinados no configuran basicConfig — solo registran su logger.
+# La configuración de handlers la gestiona el punto de entrada (pipeline.py).
 logger = logging.getLogger("techradar.extract")
 
 load_dotenv()
@@ -36,7 +39,7 @@ ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
 
 # Países cubiertos: código ISO → endpoint Adzuna
 # UK excluido: no pertenece a la UE y Eurostat no publica datos de UK post-Brexit.
-# Todos los salarios de estos países están en EUR (sin conversión necesaria).
+# Los salarios de PL (PLN) se convierten a EUR en _parse_job_record(). El resto ya usan EUR.
 ADZUNA_COUNTRIES = {
     "de": "de",
     "fr": "fr",
@@ -65,7 +68,40 @@ API_PAGE_DELAY_SECONDS = 0.5
 
 REQUEST_TIMEOUT = 15
 
+# Número de reintentos por página de la API antes de descartar la página.
+# Un error HTTP transitorio no debe cortar toda la paginación del país.
+API_MAX_RETRIES = 3
+
 CRAWL_USER_AGENT = "TechRadarBot/1.0 (portfolio project; personal research)"
+
+# Tipo de cambio PLN → EUR aplicado a salarios de Polonia.
+# La API de Adzuna devuelve salarios en moneda local. Polonia usa PLN (złoty),
+# no EUR. Sin esta conversión los salarios polacos aparecen ~4x más altos que
+# sus equivalentes en los demás países (que sí usan EUR).
+# Actualizar si la paridad cambia significativamente (1 EUR ≈ 4.27 PLN).
+PLN_TO_EUR: float = 0.2342
+
+# Umbrales para la lógica de conversión PLN → EUR en ofertas polacas.
+# Problema: no todos los salarios que devuelve Adzuna PL están en PLN.
+# Las empresas multinacionales suelen publicar el salario directamente en EUR.
+#
+#   _PLN_DAILY_RATE_MAX  — si ref cae en este rango, se trata como tarifa
+#                          diaria B2B en PLN (típico 200-800 PLN/día).
+#                          Cubre tarifas fijas (min==max) y rangos (min!=max).
+#                          Se anualiza × 220 días y luego se convierte a EUR.
+#
+#   _PLN_ALREADY_EUR_MAX — si ref < este umbral, se asume que el salario ya
+#                          está en EUR (empresa multinacional) y NO se convierte.
+#                          Rango 5.000-20.000 es ambiguo; se conserva como EUR
+#                          porque 10.000 PLN anuales sería irreal para IT.
+#
+#   _PLN_MAX_PLAUSIBLE   — si ref > este umbral, el valor se descarta como
+#                          corrupto (datos de test, error de escala, etc.).
+#                          1.500.000 PLN ≈ 351.000 EUR, ya irreal para IT en EU.
+_PLN_DAILY_RATE_MAX    = 5_000     # por debajo → tarifa diaria B2B en PLN
+_PLN_DAILY_WORKING_DAYS = 220      # días laborables para anualizar tarifas B2B
+_PLN_ALREADY_EUR_MAX   = 20_000    # por debajo → asumir EUR, no convertir
+_PLN_MAX_PLAUSIBLE     = 1_500_000 # por encima → dato corrupto, nullear
 
 
 # =============================================================================
@@ -119,45 +155,99 @@ def fetch_adzuna_page(
     url = f"{ADZUNA_BASE_URL}/{endpoint}/search/{page}"
     params = _build_adzuna_params(page, max_days_old)
 
-    try:
-        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError as exc:
-        logger.warning("HTTP error en %s página %d: %s", country_code, page, exc)
-        return None
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Error de red en %s página %d: %s", country_code, page, exc)
-        return None
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            if attempt == API_MAX_RETRIES:
+                logger.error(
+                    "Fallo definitivo en %s página %d tras %d intentos: %s",
+                    country_code, page, API_MAX_RETRIES, exc,
+                )
+                return None
+            wait = 2 ** attempt  # backoff: 2s, 4s
+            logger.warning(
+                "Reintento %d/%d en %s página %d (espera %ds): %s",
+                attempt, API_MAX_RETRIES, country_code, page, wait, exc,
+            )
+            time.sleep(wait)
+    return None
 
 
 def _parse_job_record(raw_job: dict, country_code: str) -> dict:
     """
     Extrae y normaliza los campos relevantes de un registro raw de la API.
 
-    Los 8 países cubiertos usan EUR como moneda, no se necesita conversión.
+    Los salarios de PL (PLN) se convierten a EUR. El resto de países ya usan EUR.
 
     Args:
         raw_job (dict): Registro tal como llega de la API de Adzuna.
         country_code (str): Código ISO del país de la oferta.
 
     Returns:
-        dict: Registro normalizado listo para construir el DataFrame.
+        dict | None: Registro normalizado, o None si el registro no tiene ID válido.
     """
+    # Validar que el registro tenga un ID — sin él no se puede hacer UPSERT
+    raw_id = raw_job.get("id")
+    if not raw_id:
+        logger.warning("Registro sin ID descartado: title=%s", raw_job.get("title", ""))
+        return None
+
     # El último elemento del área geográfica suele ser la ciudad más específica
     location_area = raw_job.get("location", {}).get("area", [])
     city = location_area[-1] if location_area else None
 
+    salary_min = _safe_int(raw_job.get("salary_min"))
+    salary_max = _safe_int(raw_job.get("salary_max"))
+
+    # Polonia usa PLN, no EUR. Convertimos aquí para que todos los salarios
+    # de la BD estén en la misma moneda. Ver constante PLN_TO_EUR en este módulo.
+    # La lógica distingue tres casos (ver comentarios de los umbrales arriba):
+    #   1. ref > _PLN_MAX_PLAUSIBLE    → dato corrupto, nullear
+    #   2. ref >= _PLN_ALREADY_EUR_MAX → PLN anual plausible, convertir × PLN_TO_EUR
+    #   3. ref < _PLN_DAILY_RATE_MAX   → tarifa diaria B2B (min==max o rango), anualizar y convertir
+    #   4. resto (5k-20k)              → asumir EUR (multinacional), dejar
+    #
+    # NOTA: el Caso 3 cubre TODOS los valores con ref < 5.000, incluyendo rangos
+    # con min != max (p.ej. 1.560-1.800 PLN/día).
+    if country_code == "pl":
+        # Usar el valor más alto como referencia para detectar PLN.
+        # Con salary_min como ref, un salary_min pequeño (< 20k) hacía que
+        # un salary_max enorme en PLN pasara sin convertir (bug original).
+        _vals = [v for v in (salary_min, salary_max) if v is not None]
+        ref = max(_vals) if _vals else None
+        if ref is not None and ref > _PLN_MAX_PLAUSIBLE:
+            # Caso 1: valor absurdo (error de escala, dato de test) → nullear
+            salary_min = None
+            salary_max = None
+        elif ref is not None and ref >= _PLN_ALREADY_EUR_MAX:
+            # Caso 2: PLN anual plausible (20k-1.5M PLN) → convertir a EUR
+            if salary_min is not None:
+                salary_min = round(salary_min * PLN_TO_EUR)
+            if salary_max is not None:
+                salary_max = round(salary_max * PLN_TO_EUR)
+        elif ref is not None and ref < _PLN_DAILY_RATE_MAX:
+            # Caso 3: tarifa diaria B2B en PLN (ref < 5.000).
+            # Cubre min==max (tarifa fija) y min!=max (rango de tarifa).
+            # Anualizar antes de convertir para que salary_mid sea comparable.
+            if salary_min is not None:
+                salary_min = round(salary_min * _PLN_DAILY_WORKING_DAYS * PLN_TO_EUR)
+            if salary_max is not None:
+                salary_max = round(salary_max * _PLN_DAILY_WORKING_DAYS * PLN_TO_EUR)
+        # Caso 4: 5k <= ref < 20k → asumir EUR (multinacional), dejar sin convertir
+
     return {
-        "id": int(raw_job.get("id", 0)),
+        "id": int(raw_id),
         "source": "adzuna",
         "title": raw_job.get("title", "").strip(),
         "company": raw_job.get("company", {}).get("display_name", None),
         "location_display": raw_job.get("location", {}).get("display_name", None),
         "city": city,
         "country_code": country_code,
-        "salary_min": _safe_int(raw_job.get("salary_min")),
-        "salary_max": _safe_int(raw_job.get("salary_max")),
+        "salary_min": salary_min,
+        "salary_max": salary_max,
         # El campo llega como string "0" o "1" en la respuesta de la API
         "salary_is_predicted": str(raw_job.get("salary_is_predicted", "0")) == "1",
         "contract_type": raw_job.get("contract_type", None),
@@ -227,7 +317,8 @@ def fetch_all_jobs_for_country(
 
         for raw_job in raw_jobs:
             parsed = _parse_job_record(raw_job, country_code)
-            all_jobs.append(parsed)
+            if parsed is not None:
+                all_jobs.append(parsed)
 
         logger.info(
             "  [%s] página %d → %d ofertas acumuladas",
@@ -241,7 +332,7 @@ def fetch_all_jobs_for_country(
     return all_jobs
 
 
-def extract_adzuna(max_days_old: int = 7) -> pd.DataFrame:
+def extract_adzuna(max_days_old: int = 7, countries: list[str] = None) -> pd.DataFrame:
     """
     Extrae todas las ofertas IT de Adzuna para los 8 países EU (zona Euro).
 
@@ -252,6 +343,9 @@ def extract_adzuna(max_days_old: int = 7) -> pd.DataFrame:
         max_days_old (int): Antigüedad máxima de las ofertas en días.
                             Usa 7 para cargas incrementales semanales.
                             Usa 30 para la carga inicial completa.
+        countries (list[str] | None): Lista de códigos de país a extraer.
+                            Si es None, extrae los 8 países por defecto.
+                            Ejemplo: ['pl'] para solo Polonia.
 
     Returns:
         pd.DataFrame: DataFrame con una fila por oferta y las columnas
@@ -263,12 +357,17 @@ def extract_adzuna(max_days_old: int = 7) -> pd.DataFrame:
             "Copia .env.example a .env y rellena tus credenciales."
         )
 
+    target_countries = countries if countries else list(ADZUNA_COUNTRIES.keys())
+    invalid = [c for c in target_countries if c not in ADZUNA_COUNTRIES]
+    if invalid:
+        raise ValueError(f"Países no soportados: {invalid}. Válidos: {list(ADZUNA_COUNTRIES.keys())}")
+
     all_jobs = []
 
     with requests.Session() as session:
         session.headers.update({"User-Agent": CRAWL_USER_AGENT})
 
-        for country_code in ADZUNA_COUNTRIES:
+        for country_code in target_countries:
             country_jobs = fetch_all_jobs_for_country(
                 session, country_code, max_days_old
             )
@@ -324,9 +423,21 @@ def crawl_description(session: requests.Session, url: str) -> Optional[str]:
         logger.debug("Crawling fallido para %s: %s", url, exc)
         return None
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    # Opción 1: trafilatura — extrae el cuerpo principal eliminando boilerplate
+    # (navegación, footer, anuncios). Mucho más robusto que selectores manuales.
+    if _TRAFILATURA_AVAILABLE:
+        extracted = trafilatura.extract(
+            response.text,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=False,
+            favor_recall=True,
+        )
+        if extracted and len(extracted.strip()) > 100:
+            return extracted.strip()
 
-    # Selectores por orden de preferencia (el DOM varía entre ofertas y países)
+    # Opción 2: selectores CSS específicos del DOM de Adzuna (fallback)
+    soup = BeautifulSoup(response.text, "html.parser")
     description_text = None
 
     for selector in [
@@ -335,14 +446,16 @@ def crawl_description(session: requests.Session, url: str) -> Optional[str]:
         "[data-automation='jobDescription']",
         "div.jobDescription",
         "div#job-description",
+        "div.job-description",
         "article",
+        "main",
     ]:
         element = soup.select_one(selector)
         if element:
             description_text = element.get_text(separator="\n", strip=True)
             break
 
-    # Fallback al body completo si ningún selector encaja
+    # Opción 3: body completo como último recurso
     if not description_text:
         body = soup.find("body")
         if body:
@@ -359,6 +472,8 @@ def crawl_description(session: requests.Session, url: str) -> Optional[str]:
 def enrich_with_full_descriptions(
     raw_jobs_df: pd.DataFrame,
     crawl_delay: float = CRAWL_DELAY_SECONDS,
+    checkpoint_path: Optional[str] = None,
+    checkpoint_every: int = 200,
 ) -> pd.DataFrame:
     """
     Enriquece el DataFrame de ofertas con el texto completo de cada oferta
@@ -367,10 +482,19 @@ def enrich_with_full_descriptions(
     Las ofertas donde el crawling falle mantendrán description_full = None.
     El pipeline usa description_short como fallback en esos casos.
 
+    Soporta reanudación: si checkpoint_path apunta a un fichero existente,
+    carga el progreso previo y solo procesa las ofertas pendientes
+    (description_full == None). El checkpoint se actualiza cada
+    checkpoint_every ofertas procesadas.
+
     Args:
         raw_jobs_df (pd.DataFrame): DataFrame de salida de extract_adzuna().
         crawl_delay (float): Segundos de pausa entre peticiones de crawling.
                              Por defecto 2.0 para respetar el servidor.
+        checkpoint_path (str | None): Ruta al fichero CSV de checkpoint.
+                             Si existe, se reanuda desde él. Si no existe,
+                             se crea al procesar las primeras checkpoint_every ofertas.
+        checkpoint_every (int): Cada cuántas ofertas procesadas se guarda el checkpoint.
 
     Returns:
         pd.DataFrame: Mismo DataFrame con la columna description_full rellena
@@ -379,37 +503,73 @@ def enrich_with_full_descriptions(
     if raw_jobs_df.empty:
         return raw_jobs_df
 
-    enriched_df = raw_jobs_df.copy()
-    total = len(enriched_df)
-    success_count = 0
+    # ── Reanudación desde checkpoint ─────────────────────────────────────────
+    checkpoint_file = Path(checkpoint_path) if checkpoint_path else None
 
-    logger.info("Iniciando crawling de %d ofertas (delay=%.1fs)...", total, crawl_delay)
+    if checkpoint_file and checkpoint_file.exists():
+        logger.info("Cargando progreso de crawling desde checkpoint: %s", checkpoint_file)
+        enriched_df = pd.read_csv(checkpoint_file)
+        enriched_df["posted_at"] = pd.to_datetime(
+            enriched_df["posted_at"], utc=True, errors="coerce"
+        )
+        already_done = int(enriched_df["description_full"].notna().sum())
+        logger.info("  %d ofertas ya procesadas en checkpoint.", already_done)
+    else:
+        enriched_df = raw_jobs_df.copy()
+        already_done = 0
+
+    # Solo procesar las que aún no tienen description_full
+    pending_mask = enriched_df["url"].notna() & enriched_df["description_full"].isna()
+    total = len(enriched_df)
+    pending_count = int(pending_mask.sum())
+    success_count = already_done
+
+    logger.info(
+        "Iniciando crawling de %d ofertas pendientes/%d totales (delay=%.1fs)...",
+        pending_count, total, crawl_delay,
+    )
 
     with requests.Session() as session:
         session.headers.update({"User-Agent": CRAWL_USER_AGENT})
 
-        for idx, row in enriched_df.iterrows():
-            url = row.get("url")
+        crawled_this_run = 0
 
-            if not url:
-                continue
+        for idx in enriched_df[pending_mask].index:
+            # Delay antes de cada petición salvo la primera (no desperdiciar tiempo al inicio)
+            if crawled_this_run > 0:
+                time.sleep(crawl_delay)
 
+            url = enriched_df.at[idx, "url"]
             full_text = crawl_description(session, url)
 
             if full_text:
                 enriched_df.at[idx, "description_full"] = full_text
                 success_count += 1
             else:
-                logger.debug("Sin descripción completa para job_id=%s", row.get("id"))
+                logger.debug("Sin descripción completa para job_id=%s", enriched_df.at[idx, "id"])
 
-            current_pos = enriched_df.index.get_loc(idx) + 1
+            crawled_this_run += 1
+            current_pos = already_done + crawled_this_run
+
             if current_pos % 50 == 0:
                 logger.info(
                     "  Crawling: %d/%d procesadas (%d con éxito)",
                     current_pos, total, success_count,
                 )
 
-            time.sleep(crawl_delay)
+            # Guardar checkpoint periódico
+            if checkpoint_file and crawled_this_run % checkpoint_every == 0:
+                checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                enriched_df.to_csv(checkpoint_file, index=False)
+                logger.info(
+                    "  Checkpoint guardado (%d/%d procesadas).", current_pos, total
+                )
+
+    # Checkpoint final con el estado completo
+    if checkpoint_file:
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        enriched_df.to_csv(checkpoint_file, index=False)
+        logger.info("  Checkpoint final guardado: %s", checkpoint_file)
 
     success_rate = (success_count / total * 100) if total > 0 else 0
     logger.info(

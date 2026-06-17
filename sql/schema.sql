@@ -3,7 +3,8 @@
 -- Fuentes: Adzuna API (IT jobs, 8 paises EU) + Eurostat (contexto macro)
 -- Cobertura: DE, FR, ES, NL, PL, IT, AT, BE
 -- UK excluido: no pertenece a la UE y Eurostat no publica datos de UK post-Brexit.
--- Todos los salarios en EUR (moneda unica, sin conversion necesaria).
+-- Todos los salarios almacenados en EUR. Los salarios de PL (PLN) se convierten
+-- a EUR en extract.py (_parse_job_record) antes de la carga.
 -- Cumple 3FN.
 -- =============================================================================
 
@@ -39,8 +40,8 @@ ON CONFLICT (code) DO NOTHING;
 -- =============================================================================
 -- TABLA: jobs
 -- Una fila por oferta de empleo. Fuente: Adzuna API + crawling redirect_url.
--- Cumple 3FN. Todos los salarios estan en EUR (moneda unica de los 8 paises).
--- No se necesita tabla de conversion de moneda: todos los paises usan EUR.
+-- Cumple 3FN. Todos los salarios almacenados en EUR.
+-- Los salarios de PL (PLN) se convierten a EUR en extract.py antes de la carga.
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS jobs (
 
@@ -109,7 +110,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     CONSTRAINT chk_jobs_salary_range
         CHECK (salary_max IS NULL OR salary_min IS NULL OR salary_max >= salary_min),
     CONSTRAINT chk_jobs_salary_positive
-        CHECK (salary_min IS NULL OR salary_min >= 0),
+        CHECK (
+            (salary_min IS NULL OR salary_min >= 0)
+            AND (salary_max IS NULL OR salary_max >= 0)
+        ),
     CONSTRAINT chk_jobs_contract_type
         CHECK (contract_type IS NULL OR contract_type IN ('permanent', 'contract')),
     CONSTRAINT chk_jobs_contract_time
@@ -121,7 +125,8 @@ CREATE TABLE IF NOT EXISTS jobs (
             'data_engineering', 'data_science', 'data_analyst',
             'backend', 'frontend', 'fullstack',
             'devops', 'cloud', 'security',
-            'mobile', 'ai_ml', 'other'
+            'mobile', 'ai_ml', 'other',
+            'qa_testing', 'sysadmin', 'erp_sap', 'management'
         ))
 );
 
@@ -228,6 +233,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_contract_type
 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen
     ON jobs (first_seen_at DESC);
 
+-- jobs: vistas de tendencia mensual y demanda por rol (filtran por pais + fecha)
+CREATE INDEX IF NOT EXISTS idx_jobs_country_posted
+    ON jobs (country_code, posted_at DESC NULLS LAST)
+    WHERE posted_at IS NOT NULL;
+
 -- jobs: filtro por categoria de rol
 CREATE INDEX IF NOT EXISTS idx_jobs_role_category
     ON jobs (role_category, country_code)
@@ -326,6 +336,7 @@ GROUP BY j.country_code, c.name
 ORDER BY remote_pct DESC;
 
 -- Vista: evolucion mensual de numero de ofertas por pais
+-- Filtra is_active=TRUE para coherencia con el resto de vistas del dashboard.
 CREATE OR REPLACE VIEW v_job_trends_monthly AS
 SELECT
     DATE_TRUNC('month', j.posted_at)    AS month,
@@ -335,6 +346,7 @@ SELECT
 FROM jobs j
 JOIN countries c ON c.code = j.country_code
 WHERE j.posted_at IS NOT NULL
+  AND j.is_active = TRUE
 GROUP BY DATE_TRUNC('month', j.posted_at), j.country_code, c.name
 ORDER BY month DESC, job_count DESC;
 
@@ -362,6 +374,7 @@ GROUP BY j.country_code, c.name, j.role_category
 ORDER BY j.country_code, median_salary_eur DESC NULLS LAST;
 
 -- Vista: evolucion mensual de ofertas desglosada por rol
+-- Filtra is_active=TRUE para coherencia con el resto de vistas del dashboard.
 CREATE OR REPLACE VIEW v_demand_by_role_monthly AS
 SELECT
     DATE_TRUNC('month', j.posted_at)    AS month,
@@ -373,6 +386,7 @@ FROM jobs j
 JOIN countries c ON c.code = j.country_code
 WHERE j.posted_at    IS NOT NULL
   AND j.role_category IS NOT NULL
+  AND j.is_active     = TRUE
 GROUP BY DATE_TRUNC('month', j.posted_at), j.country_code, c.name, j.role_category
 ORDER BY month DESC, j.country_code, job_count DESC;
 

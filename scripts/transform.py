@@ -18,12 +18,18 @@ from typing import Optional
 
 import pandas as pd
 
-from scripts.skills_catalog import REMOTE_NEGATIVE, REMOTE_POSITIVE, ROLE_KEYWORDS, SKILLS
+from scripts.skills_catalog import (
+    NON_IT_PATTERNS,
+    REMOTE_NEGATIVE,
+    REMOTE_POSITIVE,
+    ROLE_DESC_KEYWORDS,
+    ROLE_KEYWORDS,
+    SKILLS,
+)
 
 logger = logging.getLogger("techradar.transform")
 
 # Compilar todos los patrones una sola vez al importar el módulo.
-# Iterarlo cada vez que se procesa una oferta sería muy lento a escala.
 _SKILLS_COMPILED = [
     (name, category, [re.compile(p, re.IGNORECASE) for p in patterns])
     for name, category, patterns in SKILLS
@@ -149,20 +155,86 @@ def _detect_remote(
     return None
 
 
-def _classify_role(title: Optional[str]) -> Optional[str]:
+def _clean_description_text(text: Optional[str]) -> Optional[str]:
     """
-    Asigna una categoría de rol a partir del título de la oferta.
+    Limpia el texto de una descripción eliminando artefactos típicos de crawling.
 
-    Evalúa las categorías en orden de especificidad (de más a menos específico)
-    y devuelve la primera coincidencia. Devuelve 'other' si el título existe pero
-    no encaja en ninguna categoría conocida, y None si no hay título.
+    Elimina líneas demasiado cortas (botones, ítems de navegación), líneas
+    duplicadas (footers repetidos, encabezados) y colapsa el resultado en un
+    único párrafo normalizado listo para la extracción de skills y la clasificación.
+
+    Args:
+        text (str | None): Texto crudo de description_full o description_short.
+
+    Returns:
+        str | None: Texto limpio en una sola línea, o None si queda vacío.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    lines = text.splitlines()
+    cleaned_lines: list[str] = []
+    seen_lines: set[str] = set()
+
+    for line in lines:
+        stripped = line.strip()
+        # Descartar líneas muy cortas: casi siempre son ítems de navegación
+        if len(stripped) < 15:
+            continue
+        # Descartar líneas duplicadas (footers, encabezados repetidos)
+        normalized = re.sub(r"\s+", " ", stripped.lower())
+        if normalized in seen_lines:
+            continue
+        seen_lines.add(normalized)
+        cleaned_lines.append(stripped)
+
+    result = " ".join(cleaned_lines)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result if result else None
+
+
+def _classify_role(
+    title: Optional[str],
+    description: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Asigna una categoría de rol a partir del título y, opcionalmente, la descripción.
+
+    Pasos en orden:
+      1. Detecta roles no-IT (NON_IT_PATTERNS) → devuelve None para excluirlos.
+      2. Busca en el título usando ROLE_KEYWORDS (más de 600 patrones multilingüe).
+      3. Si el título no encaja, busca en la descripción usando ROLE_DESC_KEYWORDS
+         (frases compuestas más seguras para evitar falsos positivos en texto largo).
+      4. Devuelve 'other' solo si no hay ninguna coincidencia.
+
+    Args:
+        title (str | None): Título de la oferta.
+        description (str | None): Texto de la descripción (full o short).
+
+    Returns:
+        str | None: Categoría del rol, 'other', o None si es rol no-IT o sin título.
     """
     if not title or not isinstance(title, str):
         return None
-    title_lower = title.lower()
+
+    title_lower = title.lower().replace("_", " ")
+
+    # Paso 1: descartar roles claramente no-IT antes de clasificar
+    if any(pattern in title_lower for pattern in NON_IT_PATTERNS):
+        return None
+
+    # Paso 2: clasificar por título (prioridad máxima, más preciso)
     for category, keywords in ROLE_KEYWORDS.items():
         if any(kw in title_lower for kw in keywords):
             return category
+
+    # Paso 3: fallback a descripción con patrones más conservadores
+    if description and isinstance(description, str):
+        desc_lower = description.lower()
+        for category, desc_keywords in ROLE_DESC_KEYWORDS.items():
+            if any(kw in desc_lower for kw in desc_keywords):
+                return category
+
     return "other"
 
 
@@ -170,8 +242,11 @@ def _extract_skills(text: Optional[str]) -> list[dict]:
     """
     Extrae las skills mencionadas en un texto usando el catálogo de patrones.
 
-    Cada skill aparece como máximo una vez en el resultado aunque se mencione
-    varias veces en el texto.
+    Cada skill aparece como máximo una vez aunque se mencione varias veces.
+    Usa estrategia longest-match por span de texto: si un patrón compuesto
+    (p.ej. "GitHub Actions") ya consumió un span, los patrones simples que sean
+    subpatrones de ese span (p.ej. "GitHub") no generan una skill adicional.
+    Esto evita double-match entre pares como GitHub/GitHub Actions, Spark/Spark Streaming.
 
     Args:
         text: Texto sobre el que buscar (título + descripción concatenados).
@@ -181,14 +256,39 @@ def _extract_skills(text: Optional[str]) -> list[dict]:
     """
     if not text or not isinstance(text, str):
         return []
-    found = []
-    seen: set[str] = set()
+
+    # Recopilar todos los matches con sus spans para aplicar longest-match
+    # Estructura: lista de (start, end, name, category)
+    all_matches: list[tuple[int, int, str, str]] = []
+    seen_names: set[str] = set()
+
     for name, category, compiled_patterns in _SKILLS_COMPILED:
-        if name in seen:
+        if name in seen_names:
             continue
-        if any(p.search(text) for p in compiled_patterns):
+        for pattern in compiled_patterns:
+            match = pattern.search(text)
+            if match:
+                all_matches.append((match.start(), match.end(), name, category))
+                seen_names.add(name)
+                break  # un patrón que encaja es suficiente para esta skill
+
+    if not all_matches:
+        return []
+
+    # Ordenar por longitud del span descendente (longest-match primero)
+    all_matches.sort(key=lambda m: -(m[1] - m[0]))
+
+    # Seleccionar matches sin solapamiento: un span ya cubierto por un match
+    # más largo no genera skill adicional.
+    accepted_spans: list[tuple[int, int]] = []
+    found: list[dict] = []
+
+    for start, end, name, category in all_matches:
+        overlaps = any(s < end and start < e for s, e in accepted_spans)
+        if not overlaps:
+            accepted_spans.append((start, end))
             found.append({"name": name, "category": category})
-            seen.add(name)
+
     return found
 
 
@@ -232,10 +332,10 @@ def _validate_jobs(df: pd.DataFrame) -> pd.DataFrame:
             )
             df = df[~mask_bad_country].copy()
 
-    # 4. Deduplicar por id dentro del batch
+    # 4. Deduplicar por id dentro del batch (los conflictos con BD se resuelven vía UPSERT)
     dupes = df.duplicated(subset=["id"], keep="first")
     if dupes.any():
-        logger.warning("Eliminando %d ids duplicados en el batch.", dupes.sum())
+        logger.warning("Eliminando %d ids duplicados en el batch (primera aparición conservada).", dupes.sum())
         df = df[~dupes].copy()
 
     discarded = initial - len(df)
@@ -291,6 +391,11 @@ def transform_jobs(
         if col in df.columns:
             df[col] = df[col].apply(_normalize_string)
 
+    # Truncar a los límites VARCHAR del schema
+    for col, limit in [("title", 255), ("company", 255), ("location_display", 255), ("city", 100)]:
+        if col in df.columns:
+            df[col] = df[col].str[:limit]
+
     # 2. Validación — descarta filas que romperían constraints del schema
     df = _validate_jobs(df)
     if df.empty:
@@ -306,6 +411,8 @@ def transform_jobs(
         df["contract_time"] = df["contract_time"].apply(_normalize_contract_time)
 
     # 4. Salary mid
+    # Nota: la conversión PLN → EUR ya la aplica extract.py en _parse_job_record.
+    # transform.py recibe los salarios ya en EUR para todos los países.
     df["salary_mid"] = df.apply(
         lambda r: _compute_salary_mid(r.get("salary_min"), r.get("salary_max")),
         axis=1,
@@ -321,16 +428,24 @@ def transform_jobs(
         axis=1,
     )
 
-    # 6. Role category
-    df["role_category"] = df["title"].apply(_classify_role)
+    # 6. Role category — usa título + descripción para cubrir más casos.
+    def _classify_role_with_desc(row) -> Optional[str]:
+        """Wrapper que pasa título y descripción limpia a _classify_role."""
+        title = row.get("title")
+        desc_raw = row.get("description_full") or row.get("description_short")
+        desc_clean = _clean_description_text(desc_raw)
+        return _classify_role(title, desc_clean)
+
+    df["role_category"] = df.apply(_classify_role_with_desc, axis=1)
 
     # 7. Extracción de skills
+    # La descripción se limpia antes de pasarla al extractor para reducir
+    # el ruido de navegación, footers y artefactos de crawling.
     skill_records = []
     for _, row in df.iterrows():
-        # Concatenar título y descripción para maximizar la señal de NLP.
-        # description_full tiene preferencia sobre description_short.
         parts = [row.get("title") or ""]
-        desc = row.get("description_full") or row.get("description_short") or ""
+        desc_raw = row.get("description_full") or row.get("description_short") or ""
+        desc = _clean_description_text(desc_raw) or ""
         parts.append(desc)
         text = " ".join(p for p in parts if isinstance(p, str) and p.strip())
 

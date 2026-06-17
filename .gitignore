@@ -10,15 +10,14 @@ venv/
 # Notebooks
 .ipynb_checkpoints/
 
-# Datos crudos (no versionar)
+# Datos crudos y checkpoints (no versionar)
 data/raw/
 data/processed/
+data/checkpoints/
 
 # Misc
 *.log
 .DS_Store
 
 # Documentación interna — no debe aparecer en el repositorio público.
-# Aquí van: notas de trabajo, borradores, instrucciones para herramientas IA,
-# documentación de decisiones internas y cualquier archivo que no sea código.
 notes/

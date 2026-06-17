@@ -1,0 +1,189 @@
+# .github/workflows/pipeline.yml
+# Dos jobs independientes:
+#
+#   run-pipeline     — ETL semanal (lunes 6AM UTC) + email de resumen
+#   monthly-report   — Informe de salud mensual (día 1 de cada mes, 8AM UTC)
+#
+# Secretos necesarios en Settings → Secrets and variables → Actions:
+#   DATABASE_URL       — connection string de Supabase PostgreSQL
+#   ADZUNA_APP_ID      — ID de aplicación de la API de Adzuna
+#   ADZUNA_APP_KEY     — clave de la API de Adzuna
+#   GMAIL_USER         — dirección Gmail desde la que se envían los emails
+#   GMAIL_APP_PASSWORD — App Password de Gmail (16 chars, sin espacios)
+
+name: TechRadar Pipelines
+
+on:
+  # ── Pipeline semanal: cada lunes a las 6:00 AM UTC ────────────────────────
+  schedule:
+    - cron: "0 6 * * 1"    # lunes 6AM UTC — pipeline ETL semanal
+    - cron: "0 8 1 * *"    # día 1 de cada mes 8AM UTC — informe mensual
+
+  # Permite lanzar cualquier job manualmente desde la UI de GitHub Actions.
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Job a ejecutar"
+        required: true
+        default: "pipeline"
+        type: choice
+        options:
+          - pipeline
+          - monthly-report
+      days:
+        description: "Antigüedad máxima de las ofertas en días (solo pipeline)"
+        required: false
+        default: "7"
+        type: string
+      crawling:
+        description: "Activar crawling de description_full (solo pipeline)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      eurostat:
+        description: "Actualizar datos de Eurostat (solo pipeline)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# =============================================================================
+# JOB 1: Pipeline ETL semanal
+# =============================================================================
+
+jobs:
+  run-pipeline:
+    name: Pipeline ETL semanal
+    # Ejecutar cuando:
+    #   - Es el cron de los lunes (schedule con "* * 1")
+    #   - O es un dispatch manual con job=pipeline
+    if: |
+      (github.event_name == 'schedule' && contains(github.event.schedule, '* * 1')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'pipeline')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Abortar si supera 1 hora (carga inicial ~40 min, semanal ~10 min)
+    # Evitar ejecuciones paralelas: dos runs simultáneos sobre la misma BD causan
+    # conflictos de checkpoint y duplicación de crawling.
+    concurrency:
+      group: techradar-pipeline
+      cancel-in-progress: false  # esperar — no cancelar; perder una carga es peor que esperar
+
+    steps:
+      # 1. Descargar el código del repositorio
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # 2. Instalar Python 3.11
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 3. Caché de dependencias pip para acelerar ejecuciones futuras.
+      #    La caché se invalida cuando cambia requirements.txt.
+      - name: Caché de dependencias pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 4. Instalar dependencias del proyecto
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      # 5. Construir los argumentos del pipeline según el modo de ejecución.
+      #    - En cron (schedule): valores por defecto (7 días, crawling y eurostat activos)
+      #    - En manual (workflow_dispatch): usa los inputs del formulario
+      - name: Construir argumentos del pipeline
+        id: args
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DAYS="${{ github.event.inputs.days }}"
+            CRAWLING="${{ github.event.inputs.crawling }}"
+            EUROSTAT="${{ github.event.inputs.eurostat }}"
+          else
+            DAYS="7"
+            CRAWLING="true"
+            EUROSTAT="true"
+          fi
+
+          PIPELINE_ARGS="--days $DAYS"
+          [ "$CRAWLING"  = "false" ] && PIPELINE_ARGS="$PIPELINE_ARGS --no-crawl"
+          [ "$EUROSTAT"  = "false" ] && PIPELINE_ARGS="$PIPELINE_ARGS --no-eurostat"
+
+          echo "pipeline_args=$PIPELINE_ARGS" >> "$GITHUB_OUTPUT"
+          echo "Argumentos: $PIPELINE_ARGS"
+
+      # 6. Ejecutar el pipeline ETL
+      - name: Ejecutar pipeline
+        id: pipeline
+        env:
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+        run: |
+          python -m scripts.pipeline ${{ steps.args.outputs.pipeline_args }}
+
+      # 7. Enviar email de resumen (siempre — éxito O fallo)
+      #    Lee data/pipeline_summary.json escrito por pipeline.py
+      #    e incluye el enlace directo a este log de GitHub Actions.
+      - name: Enviar email de resumen
+        if: always()
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          PIPELINE_STATUS:    ${{ job.status }}
+          ACTIONS_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python -m scripts.notify
+
+# =============================================================================
+# JOB 2: Informe mensual de salud de la BD
+# =============================================================================
+
+  monthly-report:
+    name: Informe mensual de salud
+    # Ejecutar cuando:
+    #   - Es el cron mensual (día 1 de cada mes)
+    #   - O es un dispatch manual con job=monthly-report
+    if: |
+      (github.event_name == 'schedule' && contains(github.event.schedule, '1 * *')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'monthly-report')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Caché de dependencias pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Generar y enviar informe mensual
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python -m scripts.monthly_health_report
