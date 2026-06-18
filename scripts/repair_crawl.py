@@ -26,9 +26,9 @@ import requests
 from dotenv import load_dotenv
 
 from scripts.extract import (
+    CRAWL_BROWSER_HEADERS,
     CRAWL_CIRCUIT_BREAKER_THRESHOLD,
     CRAWL_DELAY_SECONDS,
-    CRAWL_USER_AGENT,
     crawl_description,
 )
 from scripts.load import _get_connection
@@ -163,7 +163,7 @@ def run_repair(
     pending_updates: list[tuple[int, str]] = []
 
     with requests.Session() as session:
-        session.headers.update({"User-Agent": CRAWL_USER_AGENT})
+        session.headers.update(CRAWL_BROWSER_HEADERS)
 
         for i, (job_id, url) in enumerate(pending):
             if i > 0:

@@ -30,7 +30,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.extract import extract_adzuna, extract_eurostat, enrich_with_full_descriptions
+from scripts.extract import (
+    ADZUNA_COUNTRIES,
+    extract_adzuna,
+    extract_eurostat,
+    enrich_with_full_descriptions,
+)
 from scripts.transform import transform_jobs, transform_eurostat
 from scripts.load import load_jobs, load_eurostat
 
@@ -149,38 +154,53 @@ def run(
         else:
             if resume:
                 logger.warning("  --resume activo pero no se encontraron checkpoints. Extrayendo desde la API.")
-            t0 = time.time()
-            raw_jobs_df = extract_adzuna(max_days_old=max_days_old, countries=countries)
-            logger.info("  Adzuna: %d ofertas extraídas (%.1fs)", len(raw_jobs_df), time.time() - t0)
+
+            # Extracción y crawling por país: cada país se crawlea inmediatamente
+            # después de extraerse para minimizar el tiempo entre la llamada a la API
+            # y el crawling del redirect_url. Si se crawlea todo al final, los países
+            # al final de la lista (ej. PL) acumulan horas de espera y acaban bloqueados.
+            target_countries = countries if countries else list(ADZUNA_COUNTRIES.keys())
+            all_country_dfs = []
+            crawl_total_acc = 0
+            crawl_success_acc = 0
+
+            for cc in target_countries:
+                t_cc = time.time()
+                cc_df = extract_adzuna(max_days_old=max_days_old, countries=[cc])
+
+                if cc_df.empty:
+                    logger.warning("  %s: sin ofertas de Adzuna.", cc.upper())
+                    continue
+
+                logger.info("  %s: %d ofertas extraídas (%.1fs)", cc.upper(), len(cc_df), time.time() - t_cc)
+
+                if crawling:
+                    t_crawl = time.time()
+                    cc_df = enrich_with_full_descriptions(cc_df)
+                    cc_ok = int(cc_df["description_full"].notna().sum())
+                    cc_total = int(cc_df["url"].notna().sum())
+                    crawl_total_acc += cc_total
+                    crawl_success_acc += cc_ok
+                    logger.info(
+                        "  %s: crawling completado — %d/%d con descripción (%.1fs)",
+                        cc.upper(), cc_ok, cc_total, time.time() - t_crawl,
+                    )
+
+                all_country_dfs.append(cc_df)
+
+            raw_jobs_df = pd.concat(all_country_dfs, ignore_index=True) if all_country_dfs else pd.DataFrame()
 
             if raw_jobs_df.empty:
                 logger.warning("Sin ofertas extraídas de Adzuna. Abortando pipeline.")
                 summary["error"] = "Adzuna no devolvió ofertas. Verificar credenciales."
                 return
 
-            # Guardar checkpoint raw inmediatamente para no perder las llamadas a la API.
-            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-            raw_jobs_df.to_csv(RAW_CHECKPOINT, index=False)
-            logger.info("  Checkpoint raw guardado: %s", RAW_CHECKPOINT)
-
-        if raw_jobs_df.empty:
-            logger.warning("Sin ofertas disponibles. Abortando pipeline.")
-            summary["error"] = "DataFrame de ofertas vacío tras extracción/checkpoint."
-            return
-
-        summary["jobs_extracted"] = len(raw_jobs_df)
-
-        if crawling:
-            t0 = time.time()
-            raw_jobs_df = enrich_with_full_descriptions(raw_jobs_df, checkpoint_path=CRAWL_CHECKPOINT)
-            crawl_total   = int(raw_jobs_df["url"].notna().sum())
-            crawl_success = int(raw_jobs_df["description_full"].notna().sum())
-            summary["crawl_total"]        = crawl_total
-            summary["crawl_success"]      = crawl_success
-            summary["crawl_success_rate"] = round(crawl_success / crawl_total * 100, 1) if crawl_total else 0.0
-            logger.info("  Crawling completado (%.1fs)", time.time() - t0)
-        else:
-            logger.info("  Crawling omitido (--no-crawl activo).")
+            if crawling:
+                summary["crawl_total"]        = crawl_total_acc
+                summary["crawl_success"]      = crawl_success_acc
+                summary["crawl_success_rate"] = round(crawl_success_acc / crawl_total_acc * 100, 1) if crawl_total_acc else 0.0
+            else:
+                logger.info("  Crawling omitido (--no-crawl activo).")
 
         # -------------------------------------------------------------------------
         # Fase 2: Transformación de ofertas

@@ -13,9 +13,11 @@ Uso:
 
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -73,6 +75,23 @@ REQUEST_TIMEOUT = 15
 API_MAX_RETRIES = 3
 
 CRAWL_USER_AGENT = "TechRadarBot/1.0 (portfolio project; personal research)"
+
+# Headers de navegador para el crawling de redirect_url.
+# Adzuna y los portales de destino aplican bot-detection en sus páginas de
+# landing (/land/ad/). Un User-Agent de bot genérico devuelve 403; headers
+# de navegador completos pasan el filtro correctamente.
+CRAWL_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # Reintentos ante throttling (429/503) en el crawling de description_full.
 # Cada reintento espera CRAWL_BACKOFF_DELAYS[intento-1] segundos antes de continuar.
@@ -412,6 +431,53 @@ def extract_adzuna(max_days_old: int = 7, countries: list[str] = None) -> pd.Dat
 # =============================================================================
 
 
+def _crawl_justjoin(session: requests.Session, url: str) -> Optional[str]:
+    """
+    Extrae la descripción de una oferta de justjoin.it usando su API pública.
+
+    justjoin.it es una SPA en React — trafilatura descarga el shell estático
+    y no encuentra texto. La API /api/offers/{slug} devuelve JSON con el campo
+    body (HTML completo de la descripción).
+
+    Args:
+        session: Sesión HTTP activa.
+        url: URL final de justjoin.it tras seguir el redirect de Adzuna.
+
+    Returns:
+        Texto limpio de la descripción, o None si no se pudo extraer.
+    """
+    # Extraer el slug: último segmento del path, sin query params.
+    # justjoin.it usa rutas /offers/{slug} y /job-offer/{slug} indistintamente.
+    slug = urlparse(url).path.rstrip("/").split("/")[-1]
+    if not slug:
+        return None
+
+    api_url = f"https://justjoin.it/api/offers/{slug}"
+
+    try:
+        resp = session.get(api_url, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        logger.debug("justjoin.it API fallida para %s: %s", api_url, exc)
+        return None
+
+    if not resp.ok:
+        logger.debug("justjoin.it API HTTP %d para %s", resp.status_code, api_url)
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    body_html = data.get("body", "")
+    if not body_html:
+        return None
+
+    soup = BeautifulSoup(body_html, "html.parser")
+    lines = [line for line in soup.get_text(separator="\n", strip=True).splitlines() if line.strip()]
+    return "\n".join(lines) if lines else None
+
+
 def crawl_description(
     session: requests.Session, url: str
 ) -> tuple[Optional[str], bool]:
@@ -464,6 +530,17 @@ def crawl_description(
         if not response.ok:
             logger.debug("HTTP %d para %s", response.status_code, url)
             return None, False
+
+        # Portales SPA que no renderizan contenido en el HTML estático.
+        # Adzuna redirige a justjoin.it via JavaScript (no via HTTP redirect),
+        # así que response.url sigue siendo adzuna.pl. La URL de destino aparece
+        # en el HTML de la landing page (link rel="preconnect" o window.location).
+        # También cubrimos el caso de redirect HTTP real por si cambia el comportamiento.
+        jj_match = re.search(r'https://justjoin\.it/[^\s"\'<>?#]+', response.text)
+        if jj_match or "justjoin.it" in response.url:
+            jj_url = jj_match.group(0) if jj_match else response.url
+            text = _crawl_justjoin(session, jj_url)
+            return text, False
 
         # Opción 1: trafilatura — extrae el cuerpo principal eliminando boilerplate
         # (navegación, footer, anuncios). Mucho más robusto que selectores manuales.
@@ -577,7 +654,7 @@ def enrich_with_full_descriptions(
     )
 
     with requests.Session() as session:
-        session.headers.update({"User-Agent": CRAWL_USER_AGENT})
+        session.headers.update(CRAWL_BROWSER_HEADERS)
 
         crawled_this_run = 0
 
