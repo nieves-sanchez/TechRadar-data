@@ -1,0 +1,22 @@
+{
+  "status": "failed",
+  "timestamp": "2026-06-17T16:35:37.025176+00:00",
+  "duration_minutes": 404.7,
+  "jobs_extracted": 16934,
+  "jobs_loaded": 13683,
+  "crawl_total": 14394,
+  "crawl_success": 9569,
+  "crawl_success_rate": 66.5,
+  "by_country": {
+    "at": 163,
+    "be": 136,
+    "de": 2174,
+    "es": 301,
+    "fr": 4801,
+    "it": 645,
+    "nl": 463,
+    "pl": 5000
+  },
+  "eurostat_loaded": false,
+  "error": "can't adapt type 'numpy.int16'"
+}
