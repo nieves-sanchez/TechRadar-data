@@ -74,6 +74,21 @@ API_MAX_RETRIES = 3
 
 CRAWL_USER_AGENT = "TechRadarBot/1.0 (portfolio project; personal research)"
 
+# Reintentos ante throttling (429/503) en el crawling de description_full.
+# Cada reintento espera CRAWL_BACKOFF_DELAYS[intento-1] segundos antes de continuar.
+# Si el tercer intento también falla por throttling, la URL se descarta y
+# crawl_description devuelve throttled=True para que el circuit breaker lo contabilice.
+CRAWL_MAX_RETRIES = 3
+CRAWL_BACKOFF_DELAYS = [30, 120]   # segundos: 1er reintento 30s, 2do reintento 2min
+
+# Códigos HTTP que indican throttling activo.
+CRAWL_THROTTLE_STATUSES = frozenset({429, 503})
+
+# Si este número de URLs consecutivas fallan por throttling, el crawling se aborta.
+# Las ofertas pendientes quedan con description_full=None para que repair_crawl.py
+# las procese más tarde, cuando la IP ya no esté bloqueada.
+CRAWL_CIRCUIT_BREAKER_THRESHOLD = 10
+
 # Tipo de cambio PLN → EUR aplicado a salarios de Polonia.
 # La API de Adzuna devuelve salarios en moneda local. Polonia usa PLN (złoty),
 # no EUR. Sin esta conversión los salarios polacos aparecen ~4x más altos que
@@ -397,76 +412,104 @@ def extract_adzuna(max_days_old: int = 7, countries: list[str] = None) -> pd.Dat
 # =============================================================================
 
 
-def crawl_description(session: requests.Session, url: str) -> Optional[str]:
+def crawl_description(
+    session: requests.Session, url: str
+) -> tuple[Optional[str], bool]:
     """
-    Descarga la página de una oferta en www.adzuna.es y extrae el texto
-    completo de la descripción.
+    Descarga la página de una oferta y extrae el texto completo de la descripción.
 
-    El redirect_url apunta directamente al dominio de Adzuna (no al anunciante),
-    por lo que no hay protección anti-bot. El crawling está autorizado por los
-    ToS de Adzuna para uso de investigación personal.
+    Ante respuestas de throttling (CRAWL_THROTTLE_STATUSES), reintenta hasta
+    CRAWL_MAX_RETRIES veces con una pausa de CRAWL_BACKOFF_DELAYS segundos entre
+    intentos. Para cualquier otro error HTTP o de red no reintenta.
+
+    El redirect_url apunta directamente al dominio de Adzuna, así que no hay
+    protección anti-bot. El crawling está autorizado por los ToS de Adzuna
+    para uso de investigación personal.
 
     Args:
         session (requests.Session): Sesión HTTP con User-Agent configurado.
         url (str): redirect_url de la oferta (campo de la API).
 
     Returns:
-        str | None: Texto limpio de la descripción completa, o None si falló.
+        tuple: (descripcion, throttled)
+            descripcion: texto limpio de la descripción, o None si no se pudo extraer.
+            throttled:   True si todos los intentos fallaron por throttling (429/503).
+                         False en cualquier otro caso (éxito, 404, error de red...).
     """
     if not url:
-        return None
+        return None, False
 
-    try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        logger.debug("Crawling fallido para %s: %s", url, exc)
-        return None
+    for attempt in range(1, CRAWL_MAX_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        except requests.exceptions.RequestException as exc:
+            logger.debug("Crawling fallido para %s: %s", url, exc)
+            return None, False
 
-    # Opción 1: trafilatura — extrae el cuerpo principal eliminando boilerplate
-    # (navegación, footer, anuncios). Mucho más robusto que selectores manuales.
-    if _TRAFILATURA_AVAILABLE:
-        extracted = trafilatura.extract(
-            response.text,
-            include_comments=False,
-            include_tables=False,
-            no_fallback=False,
-            favor_recall=True,
-        )
-        if extracted and len(extracted.strip()) > 100:
-            return extracted.strip()
+        if response.status_code in CRAWL_THROTTLE_STATUSES:
+            if attempt < CRAWL_MAX_RETRIES:
+                wait = CRAWL_BACKOFF_DELAYS[attempt - 1]
+                logger.warning(
+                    "Throttling HTTP %d en intento %d/%d — esperando %ds: %s",
+                    response.status_code, attempt, CRAWL_MAX_RETRIES, wait, url,
+                )
+                time.sleep(wait)
+                continue
+            logger.warning(
+                "Throttling persistente (HTTP %d) tras %d intentos: %s",
+                response.status_code, CRAWL_MAX_RETRIES, url,
+            )
+            return None, True
 
-    # Opción 2: selectores CSS específicos del DOM de Adzuna (fallback)
-    soup = BeautifulSoup(response.text, "html.parser")
-    description_text = None
+        if not response.ok:
+            logger.debug("HTTP %d para %s", response.status_code, url)
+            return None, False
 
-    for selector in [
-        "section.adp-body",
-        "div.adp-body",
-        "[data-automation='jobDescription']",
-        "div.jobDescription",
-        "div#job-description",
-        "div.job-description",
-        "article",
-        "main",
-    ]:
-        element = soup.select_one(selector)
-        if element:
-            description_text = element.get_text(separator="\n", strip=True)
-            break
+        # Opción 1: trafilatura — extrae el cuerpo principal eliminando boilerplate
+        # (navegación, footer, anuncios). Mucho más robusto que selectores manuales.
+        if _TRAFILATURA_AVAILABLE:
+            extracted = trafilatura.extract(
+                response.text,
+                include_comments=False,
+                include_tables=False,
+                no_fallback=False,
+                favor_recall=True,
+            )
+            if extracted and len(extracted.strip()) > 100:
+                return extracted.strip(), False
 
-    # Opción 3: body completo como último recurso
-    if not description_text:
-        body = soup.find("body")
-        if body:
-            description_text = body.get_text(separator="\n", strip=True)
+        # Opción 2: selectores CSS específicos del DOM de Adzuna (fallback)
+        soup = BeautifulSoup(response.text, "html.parser")
+        description_text = None
 
-    # Eliminar líneas vacías consecutivas
-    if description_text:
-        lines = [line for line in description_text.splitlines() if line.strip()]
-        description_text = "\n".join(lines)
+        for selector in [
+            "section.adp-body",
+            "div.adp-body",
+            "[data-automation='jobDescription']",
+            "div.jobDescription",
+            "div#job-description",
+            "div.job-description",
+            "article",
+            "main",
+        ]:
+            element = soup.select_one(selector)
+            if element:
+                description_text = element.get_text(separator="\n", strip=True)
+                break
 
-    return description_text if description_text else None
+        # Opción 3: body completo como último recurso
+        if not description_text:
+            body = soup.find("body")
+            if body:
+                description_text = body.get_text(separator="\n", strip=True)
+
+        if description_text:
+            lines = [line for line in description_text.splitlines() if line.strip()]
+            description_text = "\n".join(lines)
+
+        return (description_text if description_text else None), False
+
+    return None, False
 
 
 def enrich_with_full_descriptions(
@@ -480,7 +523,10 @@ def enrich_with_full_descriptions(
     obtenido via crawling del redirect_url.
 
     Las ofertas donde el crawling falle mantendrán description_full = None.
-    El pipeline usa description_short como fallback en esos casos.
+    Ante throttling (429/503), crawl_description reintenta con backoff. Si
+    CRAWL_CIRCUIT_BREAKER_THRESHOLD URLs consecutivas siguen fallando por
+    throttling, el crawling se detiene: las ofertas restantes quedan con
+    description_full=None y repair_crawl.py las procesará más tarde.
 
     Soporta reanudación: si checkpoint_path apunta a un fichero existente,
     carga el progreso previo y solo procesa las ofertas pendientes
@@ -523,6 +569,7 @@ def enrich_with_full_descriptions(
     total = len(enriched_df)
     pending_count = int(pending_mask.sum())
     success_count = already_done
+    consecutive_throttled = 0
 
     logger.info(
         "Iniciando crawling de %d ofertas pendientes/%d totales (delay=%.1fs)...",
@@ -535,18 +582,37 @@ def enrich_with_full_descriptions(
         crawled_this_run = 0
 
         for idx in enriched_df[pending_mask].index:
-            # Delay antes de cada petición salvo la primera (no desperdiciar tiempo al inicio)
+            # Delay antes de cada petición salvo la primera
             if crawled_this_run > 0:
                 time.sleep(crawl_delay)
 
             url = enriched_df.at[idx, "url"]
-            full_text = crawl_description(session, url)
+            full_text, throttled = crawl_description(session, url)
 
-            if full_text:
-                enriched_df.at[idx, "description_full"] = full_text
-                success_count += 1
+            if throttled:
+                consecutive_throttled += 1
+                logger.warning(
+                    "Throttling confirmado para job_id=%s (%d consecutivos).",
+                    enriched_df.at[idx, "id"], consecutive_throttled,
+                )
+                if consecutive_throttled >= CRAWL_CIRCUIT_BREAKER_THRESHOLD:
+                    remaining = pending_count - crawled_this_run
+                    logger.error(
+                        "Circuit breaker activado tras %d throttlings consecutivos. "
+                        "Crawling detenido — %d ofertas pendientes quedan con "
+                        "description_full=None. Ejecutar repair_crawl.py para recuperarlas.",
+                        CRAWL_CIRCUIT_BREAKER_THRESHOLD, remaining,
+                    )
+                    break
             else:
-                logger.debug("Sin descripción completa para job_id=%s", enriched_df.at[idx, "id"])
+                consecutive_throttled = 0
+                if full_text:
+                    enriched_df.at[idx, "description_full"] = full_text
+                    success_count += 1
+                else:
+                    logger.debug(
+                        "Sin descripción completa para job_id=%s", enriched_df.at[idx, "id"]
+                    )
 
             crawled_this_run += 1
             current_pos = already_done + crawled_this_run
@@ -565,7 +631,7 @@ def enrich_with_full_descriptions(
                     "  Checkpoint guardado (%d/%d procesadas).", current_pos, total
                 )
 
-    # Checkpoint final con el estado completo
+    # Checkpoint final con el estado completo (incluye el estado al parar por circuit breaker)
     if checkpoint_file:
         checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
         enriched_df.to_csv(checkpoint_file, index=False)
@@ -713,7 +779,7 @@ def extract_eurostat(since_year: int = 2019) -> pd.DataFrame:
     valid_countries = set(ADZUNA_COUNTRIES.keys())
     eurostat_df = eurostat_df[eurostat_df["country_code"].isin(valid_countries)]
 
-    eurostat_df["year"] = eurostat_df["year"].astype("Int16")
+    eurostat_df["year"] = eurostat_df["year"].astype(int)
     eurostat_df["value"] = eurostat_df["value"].round(2)
 
     logger.info(
