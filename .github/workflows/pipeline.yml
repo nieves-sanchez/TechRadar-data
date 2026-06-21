@@ -109,8 +109,8 @@ jobs:
             CRAWLING="${{ github.event.inputs.crawling }}"
             EUROSTAT="${{ github.event.inputs.eurostat }}"
           else
-            DAYS="7"
-            CRAWLING="true"
+            DAYS="5"
+            CRAWLING="false"
             EUROSTAT="true"
           fi
 
