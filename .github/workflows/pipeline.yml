@@ -140,6 +140,7 @@ jobs:
           DATABASE_URL:       ${{ secrets.DATABASE_URL }}
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT:          ${{ secrets.RECIPIENT }}
           PIPELINE_STATUS:    ${{ job.status }}
           ACTIONS_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |

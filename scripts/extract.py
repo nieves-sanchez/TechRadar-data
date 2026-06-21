@@ -11,6 +11,7 @@ Uso:
     from scripts.extract import extract_adzuna, enrich_with_full_descriptions, extract_eurostat
 """
 
+import json
 import logging
 import os
 import re
@@ -88,7 +89,7 @@ CRAWL_BROWSER_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -433,49 +434,62 @@ def extract_adzuna(max_days_old: int = 7, countries: list[str] = None) -> pd.Dat
 
 def _crawl_justjoin(session: requests.Session, url: str) -> Optional[str]:
     """
-    Extrae la descripción de una oferta de justjoin.it usando su API pública.
+    Extrae la descripción de una oferta de justjoin.it desde su HTML.
 
-    justjoin.it es una SPA en React — trafilatura descarga el shell estático
-    y no encuentra texto. La API /api/offers/{slug} devuelve JSON con el campo
-    body (HTML completo de la descripción).
+    justjoin.it usa Next.js App Router (RSC): el HTML estático no renderiza
+    el cuerpo de la oferta, pero sí incluye un script inline pequeño (~3-8 KB)
+    con el JSON de la oferta, que contiene el campo 'description' con el texto
+    completo de la descripción en plano.
 
     Args:
         session: Sesión HTTP activa.
-        url: URL final de justjoin.it tras seguir el redirect de Adzuna.
+        url: URL de la oferta en justjoin.it (cualquier path: /offers/ o /job-offer/).
 
     Returns:
         Texto limpio de la descripción, o None si no se pudo extraer.
     """
-    # Extraer el slug: último segmento del path, sin query params.
-    # justjoin.it usa rutas /offers/{slug} y /job-offer/{slug} indistintamente.
-    slug = urlparse(url).path.rstrip("/").split("/")[-1]
-    if not slug:
-        return None
-
-    api_url = f"https://justjoin.it/api/offers/{slug}"
-
     try:
-        resp = session.get(api_url, timeout=REQUEST_TIMEOUT)
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as exc:
-        logger.debug("justjoin.it API fallida para %s: %s", api_url, exc)
+        logger.debug("justjoin.it fallido para %s: %s", url, exc)
         return None
 
     if not resp.ok:
-        logger.debug("justjoin.it API HTTP %d para %s", resp.status_code, api_url)
+        logger.debug("justjoin.it HTTP %d para %s", resp.status_code, url)
         return None
 
-    try:
-        data = resp.json()
-    except ValueError:
-        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    body_html = data.get("body", "")
-    if not body_html:
-        return None
+    # Buscar el script inline que contiene el JSON de la oferta.
+    # Es el más pequeño que incluye el campo 'description' con texto largo.
+    # Los scripts del framework (>50 KB) también pueden contener 'description'
+    # pero son boilerplate de i18n — se descartan por tamaño.
+    for tag in soup.find_all("script"):
+        content = tag.string or ""
+        if "description" not in content or len(content) > 50_000:
+            continue
 
-    soup = BeautifulSoup(body_html, "html.parser")
-    lines = [line for line in soup.get_text(separator="\n", strip=True).splitlines() if line.strip()]
-    return "\n".join(lines) if lines else None
+        # Intentar parsear como JSON limpio
+        try:
+            data = json.loads(content)
+            desc = data.get("description", "")
+            if isinstance(desc, str) and len(desc) > 100:
+                return desc.strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Fallback: extraer el valor del campo 'description' con regex.
+        # json.loads sobre el match decodifica correctamente escapes \uXXXX y \n.
+        match = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+        if match:
+            try:
+                desc = json.loads(f'"{match.group(1)}"')
+                if len(desc) > 100:
+                    return desc.strip()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+    return None
 
 
 def crawl_description(
