@@ -1,0 +1,107 @@
+# .github/workflows/pipeline-b.yml
+#
+# Pipeline B v1 — Enriquecimiento de description_full
+#
+# Independiente del pipeline ETL principal (pipeline.yml). Recorre las ofertas
+# activas con URL /details/ pero sin description_full y reintenta el crawling
+# usando scripts.repair_crawl. Las URLs /land/ quedan excluidas en la propia
+# query (0% de éxito histórico — ver scripts/repair_crawl.py _fetch_pending).
+#
+# FASE INICIAL: solo se ejecuta manualmente (workflow_dispatch). El cron diario
+# está deliberadamente desactivado hasta validar el primer run (delay seguro,
+# tasa de éxito real desde IP de GitHub Actions, ausencia de throttling). Ver
+# bloque "schedule" comentado al final para activarlo cuando proceda.
+#
+# Secretos necesarios (Settings → Secrets and variables → Actions):
+#   DATABASE_URL — connection string de Supabase PostgreSQL
+
+name: Pipeline B - Description Enrichment
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Máximo de ofertas a procesar en este run"
+        required: false
+        default: "100"
+        type: string
+      delay:
+        description: "Segundos de pausa entre peticiones (2.0 = conservador, 1.5 = recomendado /details/)"
+        required: false
+        default: "1.5"
+        type: string
+      country:
+        description: "Filtrar por país (ej: pl, de, fr). Vacío = todos."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  enrich-descriptions:
+    name: Crawl description_full (/details/)
+    runs-on: ubuntu-latest
+    # Hard limit de 6h: es el máximo de GitHub Actions en plan free. El circuit
+    # breaker del script para antes si hay throttling sostenido.
+    timeout-minutes: 360
+    # Grupo de concurrencia propio, distinto del de Pipeline A (techradar-pipeline).
+    # Así un run de B no bloquea ni es bloqueado por A. No se cancelan runs en curso:
+    # perder trabajo de crawling ya hecho es peor que esperar.
+    concurrency:
+      group: techradar-pipeline-b
+      cancel-in-progress: false
+
+    steps:
+      # 1. Descargar el código del repositorio
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # 2. Instalar Python 3.12 (misma versión que Pipeline A)
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 3. Caché de dependencias pip (se invalida al cambiar requirements.txt)
+      - name: Caché de dependencias pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 4. Instalar dependencias del proyecto
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      # 5. Construir los argumentos de repair_crawl a partir de los inputs.
+      #    --country solo se añade si el input no está vacío.
+      - name: Construir argumentos
+        id: args
+        run: |
+          ARGS="--limit ${{ github.event.inputs.limit }} --delay ${{ github.event.inputs.delay }}"
+          if [ -n "${{ github.event.inputs.country }}" ]; then
+            ARGS="$ARGS --country ${{ github.event.inputs.country }}"
+          fi
+          echo "repair_args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "Argumentos: $ARGS"
+
+      # 6. Ejecutar el enriquecimiento de descripciones
+      - name: Ejecutar Pipeline B (repair_crawl)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m scripts.repair_crawl ${{ steps.args.outputs.repair_args }}
+
+# =============================================================================
+# CRON FUTURO (DESACTIVADO) — activar tras validar el backlog inicial
+# =============================================================================
+#
+# Cuando el primer run confirme delay seguro y tasa de éxito esperada, añadir al
+# bloque "on:" de arriba un disparador schedule. Propuesta del diseño técnico:
+#
+#   schedule:
+#     - cron: "0 11 * * *"   # diario 11:00 UTC — 5h después de Pipeline A (06:00)
+#
+# y un step que use los defaults del cron (limit=10000, delay=1.5, country="")
+# cuando github.event_name == 'schedule'. No activar hasta entonces.

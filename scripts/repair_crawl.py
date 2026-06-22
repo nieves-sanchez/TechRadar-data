@@ -1,10 +1,11 @@
 """
 repair_crawl.py — Rellena description_full en ofertas con crawling pendiente.
 
-Consulta en la base de datos todas las ofertas activas que tienen URL pero no
-tienen description_full, y vuelve a intentar el crawling. Diseñado para
-ejecutarse el día siguiente al pipeline principal, cuando el throttling de
-la noche anterior ya se ha disipado.
+Consulta en la base de datos las ofertas activas que tienen URL /details/ pero
+no tienen description_full, y vuelve a intentar el crawling. Excluye las URLs
+/land/ (0% de éxito histórico — ver _fetch_pending). Es el motor de Pipeline B
+v1 (enriquecimiento de descripciones), independiente del pipeline ETL principal.
+Diseñado para ejecutarse cuando el throttling de runs anteriores ya se ha disipado.
 
 Aplica el mismo sistema de backoff y circuit breaker que el pipeline principal:
 3 reintentos con backoff ante 429/503, y parada automática si 10 URLs
@@ -61,6 +62,12 @@ def _fetch_pending(
     """
     Recupera de la BD las ofertas activas con URL pero sin description_full.
 
+    Excluye las URLs /land/ (redirects de Adzuna a portales externos): la
+    auditoría 2026-06-22 confirmó 0% de éxito histórico con requests en los 8
+    países (27.953 ofertas), porque el destino es JS-rendered o tiene bot
+    detection de terceros. Procesarlas solo desperdicia tiempo de ejecución.
+    Pipeline B v1 trabaja exclusivamente sobre URLs /details/ (cobertura 71,7%).
+
     Ordena por posted_at DESC para priorizar las más recientes, que son las
     que el enriquecimiento con Ollama necesitará antes.
 
@@ -72,14 +79,19 @@ def _fetch_pending(
     Returns:
         list[tuple[int, str]]: Lista de (job_id, url).
     """
+    # El patrón LIKE se pasa como parámetro (no como literal en la query) para
+    # que psycopg2 no interprete los '%' del patrón como marcadores de formato
+    # cuando se añaden params de country/limit. Como params nunca queda vacío,
+    # execute() siempre hace la sustitución y los '%s' se resuelven igual.
     query = """
         SELECT id, url
         FROM   jobs
         WHERE  description_full IS NULL
           AND  url IS NOT NULL
           AND  is_active = TRUE
+          AND  url NOT LIKE %s
     """
-    params = []
+    params = ["%/land/%"]
 
     if country_code:
         query += " AND country_code = %s"
