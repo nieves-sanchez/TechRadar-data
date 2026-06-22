@@ -14,9 +14,9 @@
 name: TechRadar Pipelines
 
 on:
-  # ── Pipeline semanal: cada lunes a las 6:00 AM UTC ────────────────────────
+  # ── Pipeline diario: cada día a las 6:00 AM UTC (validación de producción) ──
   schedule:
-    - cron: "0 6 * * 1"    # lunes 6AM UTC — pipeline ETL semanal
+    - cron: "0 6 * * *"    # diario 6AM UTC — validación sin crawling
     - cron: "0 8 1 * *"    # día 1 de cada mes 8AM UTC — informe mensual
 
   # Permite lanzar cualquier job manualmente desde la UI de GitHub Actions.
@@ -60,10 +60,10 @@ jobs:
   run-pipeline:
     name: Pipeline ETL semanal
     # Ejecutar cuando:
-    #   - Es el cron de los lunes (schedule con "* * 1")
+    #   - Es el cron diario (6AM UTC, "0 6 * * *")
     #   - O es un dispatch manual con job=pipeline
     if: |
-      (github.event_name == 'schedule' && contains(github.event.schedule, '* * 1')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 6 * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'pipeline')
     runs-on: ubuntu-latest
     timeout-minutes: 60  # Abortar si supera 1 hora (carga inicial ~40 min, semanal ~10 min)
@@ -109,7 +109,7 @@ jobs:
             CRAWLING="${{ github.event.inputs.crawling }}"
             EUROSTAT="${{ github.event.inputs.eurostat }}"
           else
-            DAYS="5"
+            DAYS="1"
             CRAWLING="false"
             EUROSTAT="true"
           fi
