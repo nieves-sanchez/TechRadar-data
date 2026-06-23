@@ -7,10 +7,11 @@
 # usando scripts.repair_crawl. Las URLs /land/ quedan excluidas en la propia
 # query (0% de éxito histórico — ver scripts/repair_crawl.py _fetch_pending).
 #
-# FASE INICIAL: solo se ejecuta manualmente (workflow_dispatch). El cron diario
-# está deliberadamente desactivado hasta validar el primer run (delay seguro,
-# tasa de éxito real desde IP de GitHub Actions, ausencia de throttling). Ver
-# bloque "schedule" comentado al final para activarlo cuando proceda.
+# MODO MANTENIMIENTO (validado): cron diario a las 11:00 UTC, ~5h después de
+# Pipeline A (06:00 UTC). En ejecución programada usa defaults fijos
+# (limit=3000, delay=1.5, since_days=2) para enriquecer solo el inflow reciente
+# sin re-procesar la cola dura histórica. Sigue disponible la ejecución manual
+# (workflow_dispatch) con inputs personalizados.
 #
 # Secretos necesarios (Settings → Secrets and variables → Actions):
 #   DATABASE_URL — connection string de Supabase PostgreSQL
@@ -18,6 +19,13 @@
 name: Pipeline B - Description Enrichment
 
 on:
+  # Ejecución automática diaria: 11:00 UTC (~5h tras Pipeline A, 06:00 UTC).
+  # En este trigger NO hay inputs: el step de args usa defaults fijos de
+  # mantenimiento (limit=3000, delay=1.5, since_days=2, country=todos).
+  schedule:
+    - cron: "0 11 * * *"
+
+  # Ejecución manual con inputs personalizados desde la UI de GitHub Actions.
   workflow_dispatch:
     inputs:
       limit:
@@ -79,17 +87,27 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      # 5. Construir los argumentos de repair_crawl a partir de los inputs.
-      #    --country solo se añade si el input no está vacío.
-      #    --since-days solo se añade si el input es un entero > 0.
+      # 5. Construir los argumentos de repair_crawl según el tipo de trigger.
+      #    - schedule (cron diario): defaults fijos de mantenimiento. Los inputs
+      #      NO existen en ejecución programada, por eso no se leen aquí.
+      #    - workflow_dispatch (manual): usa los inputs del formulario.
+      #    --country solo se añade si no está vacío; --since-days solo si es > 0.
       - name: Construir argumentos
         id: args
         run: |
-          ARGS="--limit ${{ github.event.inputs.limit }} --delay ${{ github.event.inputs.delay }}"
-          if [ -n "${{ github.event.inputs.country }}" ]; then
-            ARGS="$ARGS --country ${{ github.event.inputs.country }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            LIMIT="3000"; DELAY="1.5"; COUNTRY=""; SINCE="2"
+          else
+            LIMIT="${{ github.event.inputs.limit }}"
+            DELAY="${{ github.event.inputs.delay }}"
+            COUNTRY="${{ github.event.inputs.country }}"
+            SINCE="${{ github.event.inputs.since_days }}"
           fi
-          SINCE="${{ github.event.inputs.since_days }}"
+
+          ARGS="--limit $LIMIT --delay $DELAY"
+          if [ -n "$COUNTRY" ]; then
+            ARGS="$ARGS --country $COUNTRY"
+          fi
           if [ -n "$SINCE" ] && [ "$SINCE" -gt 0 ] 2>/dev/null; then
             ARGS="$ARGS --since-days $SINCE"
           fi
@@ -104,14 +122,8 @@ jobs:
           python -m scripts.repair_crawl ${{ steps.args.outputs.repair_args }}
 
 # =============================================================================
-# CRON FUTURO (DESACTIVADO) — activar tras validar el backlog inicial
+# NOTA: el cron diario (11:00 UTC) quedó ACTIVADO tras validar la Fase C
+# (run since_days=2: 1421/1432 actualizadas, 99,2%, 46m). Los defaults de
+# mantenimiento se fijan en el step "Construir argumentos" para el trigger
+# schedule. Para cambiarlos, editar ese step (no hay inputs en ejecución cron).
 # =============================================================================
-#
-# Cuando el primer run confirme delay seguro y tasa de éxito esperada, añadir al
-# bloque "on:" de arriba un disparador schedule. Propuesta del diseño técnico:
-#
-#   schedule:
-#     - cron: "0 11 * * *"   # diario 11:00 UTC — 5h después de Pipeline A (06:00)
-#
-# y un step que use los defaults del cron (limit=10000, delay=1.5, country="")
-# cuando github.event_name == 'schedule'. No activar hasta entonces.
