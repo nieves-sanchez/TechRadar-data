@@ -35,6 +35,11 @@ on:
         required: false
         default: ""
         type: string
+      since_days:
+        description: "Solo ofertas posted_at en los últimos N días (evita la cola dura histórica). 0 = sin filtro temporal."
+        required: false
+        default: "0"
+        type: string
 
 jobs:
   enrich-descriptions:
@@ -76,12 +81,17 @@ jobs:
 
       # 5. Construir los argumentos de repair_crawl a partir de los inputs.
       #    --country solo se añade si el input no está vacío.
+      #    --since-days solo se añade si el input es un entero > 0.
       - name: Construir argumentos
         id: args
         run: |
           ARGS="--limit ${{ github.event.inputs.limit }} --delay ${{ github.event.inputs.delay }}"
           if [ -n "${{ github.event.inputs.country }}" ]; then
             ARGS="$ARGS --country ${{ github.event.inputs.country }}"
+          fi
+          SINCE="${{ github.event.inputs.since_days }}"
+          if [ -n "$SINCE" ] && [ "$SINCE" -gt 0 ] 2>/dev/null; then
+            ARGS="$ARGS --since-days $SINCE"
           fi
           echo "repair_args=$ARGS" >> "$GITHUB_OUTPUT"
           echo "Argumentos: $ARGS"

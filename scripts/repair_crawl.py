@@ -16,6 +16,7 @@ Uso:
     python -m scripts.repair_crawl --country pl        # solo un país
     python -m scripts.repair_crawl --limit 2000        # máximo N ofertas
     python -m scripts.repair_crawl --country pl --limit 1000
+    python -m scripts.repair_crawl --since-days 2 --limit 3000  # solo inflow reciente
 """
 
 import argparse
@@ -58,6 +59,7 @@ def _fetch_pending(
     conn,
     country_code: str = None,
     limit: int = None,
+    since_days: int = None,
 ) -> list[tuple[int, str]]:
     """
     Recupera de la BD las ofertas activas con URL pero sin description_full.
@@ -75,6 +77,12 @@ def _fetch_pending(
         conn: Conexión psycopg2 activa.
         country_code (str | None): Si se indica, filtra por ese país.
         limit (int | None): Número máximo de ofertas a recuperar.
+        since_days (int | None): Si se indica, solo ofertas con posted_at en los
+            últimos N días. Sin tracking de intentos en BD (crawl_attempts), cada
+            run reintenta las ofertas que ya fallaron. Acotar por antigüedad evita
+            re-procesar la cola dura histórica: los fallos viejos quedan fuera de
+            la ventana y solo se reintenta el inflow reciente. None = sin filtro
+            temporal (comportamiento original).
 
     Returns:
         list[tuple[int, str]]: Lista de (job_id, url).
@@ -96,6 +104,12 @@ def _fetch_pending(
     if country_code:
         query += " AND country_code = %s"
         params.append(country_code)
+
+    if since_days:
+        # make_interval(days => %s) construye el intervalo de forma segura desde
+        # un parámetro entero, sin interpolar texto en la query.
+        query += " AND posted_at >= NOW() - make_interval(days => %s)"
+        params.append(since_days)
 
     query += " ORDER BY posted_at DESC"
 
@@ -143,6 +157,7 @@ def run_repair(
     country_code: str = None,
     limit: int = None,
     crawl_delay: float = CRAWL_DELAY_SECONDS,
+    since_days: int = None,
 ) -> None:
     """
     Recupera las ofertas pendientes de crawling y actualiza description_full en la BD.
@@ -155,10 +170,14 @@ def run_repair(
         country_code (str | None): Filtra por país (ej: 'pl'). None para todos.
         limit (int | None): Número máximo de ofertas a procesar en esta ejecución.
         crawl_delay (float): Segundos de pausa entre peticiones. Por defecto 2.0.
+        since_days (int | None): Si se indica, solo ofertas con posted_at en los
+            últimos N días (ver _fetch_pending). None = sin filtro temporal.
     """
     conn = _get_connection()
 
-    pending = _fetch_pending(conn, country_code=country_code, limit=limit)
+    pending = _fetch_pending(
+        conn, country_code=country_code, limit=limit, since_days=since_days
+    )
     total = len(pending)
 
     if not pending:
@@ -168,7 +187,10 @@ def run_repair(
         return
 
     filtro = f" (país: {country_code})" if country_code else ""
-    logger.info("Ofertas pendientes: %d%s (delay=%.1fs)", total, filtro, crawl_delay)
+    ventana = f" (últimos {since_days}d)" if since_days else ""
+    logger.info(
+        "Ofertas pendientes: %d%s%s (delay=%.1fs)", total, filtro, ventana, crawl_delay
+    )
 
     success_count = 0
     consecutive_throttled = 0
@@ -261,6 +283,16 @@ if __name__ == "__main__":
         metavar="S",
         help=f"Segundos de pausa entre peticiones (default: {CRAWL_DELAY_SECONDS}).",
     )
+    parser.add_argument(
+        "--since-days",
+        type=int,
+        metavar="N",
+        help=(
+            "Procesa solo ofertas con posted_at en los últimos N días. "
+            "Evita reintentar la cola dura histórica de /details/. "
+            "Por defecto sin filtro temporal."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -268,4 +300,5 @@ if __name__ == "__main__":
         country_code=args.country,
         limit=args.limit,
         crawl_delay=args.delay,
+        since_days=args.since_days,
     )
