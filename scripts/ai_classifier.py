@@ -18,10 +18,11 @@ import requests
 
 logger = logging.getLogger("techradar.ai_classifier")
 
-OLLAMA_URL     = "http://localhost:11434/api/generate"
-OLLAMA_MODEL   = "qwen2.5:1.5b"
-OLLAMA_TIMEOUT = 15   # segundos para llamadas individuales
-BATCH_TIMEOUT  = 90   # segundos para lotes de 10 ofertas
+OLLAMA_URL        = "http://localhost:11434/api/generate"
+OLLAMA_MODEL      = "qwen2.5:1.5b"
+OLLAMA_TIMEOUT    = 15    # segundos para llamadas individuales
+BATCH_TIMEOUT     = 120   # segundos para lotes de 10 ofertas con descripción completa
+DESCRIPTION_LIMIT = 1500  # caracteres máximos de descripción por oferta en el prompt
 
 VALID_CATEGORIES = {
     "backend", "frontend", "fullstack", "data_engineering", "data_science",
@@ -55,7 +56,7 @@ def _call_ollama(prompt: str, timeout: int = OLLAMA_TIMEOUT) -> Optional[str]:
             "format": "json",
             "options": {
                 "temperature": 0.0,
-                "num_predict": 600,   # límite de tokens de respuesta (10 resultados ~500 tokens)
+                "num_predict": 800,   # límite de tokens de respuesta (10 resultados con más skills)
             },
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
@@ -137,7 +138,7 @@ def classify_batch(jobs: list[dict]) -> list[dict]:
     jobs_text = ""
     for i, job in enumerate(jobs, start=1):
         title = (job.get("title") or "").strip()
-        desc  = (job.get("description") or "")[:250].strip()
+        desc  = (job.get("description") or "")[:DESCRIPTION_LIMIT].strip()
         jobs_text += f"JOB_{i} | Title: {title} | Desc: {desc}\n"
 
     n = len(jobs)

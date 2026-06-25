@@ -15,6 +15,9 @@ data/raw/
 data/processed/
 data/checkpoints/
 
+# State local de Pipeline C — SQLite de tracking Ollama (no versionar)
+data/ollama_state/
+
 # Misc
 *.log
 .DS_Store
