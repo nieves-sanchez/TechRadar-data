@@ -647,6 +647,10 @@ def run(
             conn_cleanup.close()
         print()
 
+    # Si no se pidió modo de clasificación explícito, el cleanup fue lo único pedido
+    if cleanup_non_it and not reclassify_all and days == 0:
+        return
+
     # ─── PASO 1: Verificar Ollama ─────────────────────────────────────────────
     if not _is_ollama_available():
         logger.error("Ollama no está arrancado. Abre la aplicación Ollama.")

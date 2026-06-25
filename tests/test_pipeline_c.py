@@ -379,20 +379,72 @@ def test_cleanup_not_called_without_flag():
 
 def test_cleanup_called_with_flag():
     """
-    Con --cleanup-non-it, se llama a count_non_it_by_patterns (dry run).
+    Con --cleanup-non-it solo (sin --days ni --all): llama a count_non_it_by_patterns
+    y termina limpiamente SIN verificar Ollama ni clasificar nada.
     """
     with patch("scripts.retro_classify.count_non_it_by_patterns", return_value=42) as mock_count, \
          patch("scripts.retro_classify._get_connection") as mock_conn, \
-         patch("scripts.retro_classify._is_ollama_available", return_value=False):
-        mock_conn.return_value.__enter__ = mock_conn
-        mock_conn.return_value.__exit__ = MagicMock(return_value=False)
+         patch("scripts.retro_classify._is_ollama_available") as mock_ollama:
+        mock_conn.return_value.close = MagicMock()
+
+        from scripts.retro_classify import run
+        run(cleanup_non_it=True, confirm_cleanup=False, yes=True)  # debe retornar limpiamente
+
+        mock_count.assert_called_once()
+        mock_ollama.assert_not_called()
+
+
+def test_cleanup_confirm_only_no_ollama():
+    """
+    Con --cleanup-non-it --confirm-cleanup solo (sin --days ni --all): ejecuta
+    deactivate_non_it_by_patterns y termina SIN verificar Ollama ni clasificar.
+    """
+    with patch("scripts.retro_classify.deactivate_non_it_by_patterns", return_value=5) as mock_deact, \
+         patch("scripts.retro_classify._get_connection") as mock_conn, \
+         patch("scripts.retro_classify._is_ollama_available") as mock_ollama:
+        mock_conn.return_value.close = MagicMock()
+
+        from scripts.retro_classify import run
+        run(cleanup_non_it=True, confirm_cleanup=True, yes=True)
+
+        mock_deact.assert_called_once()
+        mock_ollama.assert_not_called()
+
+
+def test_cleanup_with_days_continues_to_ollama():
+    """
+    Con --cleanup-non-it --days 2: tras la limpieza continúa hacia clasificación
+    (verifica Ollama). Prueba que --days hace que NO se salga tras el cleanup.
+    """
+    with patch("scripts.retro_classify.count_non_it_by_patterns", return_value=3) as mock_count, \
+         patch("scripts.retro_classify._get_connection") as mock_conn, \
+         patch("scripts.retro_classify._is_ollama_available", return_value=False) as mock_ollama:
         mock_conn.return_value.close = MagicMock()
 
         from scripts.retro_classify import run
         with pytest.raises(SystemExit):
-            run(cleanup_non_it=True, confirm_cleanup=False, yes=True)
+            run(cleanup_non_it=True, days=2, yes=True)
 
-        mock_count.assert_called_once()
+        mock_count.assert_called_once()   # cleanup se ejecutó
+        mock_ollama.assert_called_once()  # llegó al check de Ollama
+
+
+def test_cleanup_with_all_continues_to_ollama():
+    """
+    Con --cleanup-non-it --all: tras la limpieza continúa hacia clasificación.
+    Prueba que --all hace que NO se salga tras el cleanup.
+    """
+    with patch("scripts.retro_classify.count_non_it_by_patterns", return_value=0) as mock_count, \
+         patch("scripts.retro_classify._get_connection") as mock_conn, \
+         patch("scripts.retro_classify._is_ollama_available", return_value=False) as mock_ollama:
+        mock_conn.return_value.close = MagicMock()
+
+        from scripts.retro_classify import run
+        with pytest.raises(SystemExit):
+            run(cleanup_non_it=True, reclassify_all=True, yes=True)
+
+        mock_count.assert_called_once()   # cleanup se ejecutó
+        mock_ollama.assert_called_once()  # llegó al check de Ollama
 
 
 # =============================================================================
