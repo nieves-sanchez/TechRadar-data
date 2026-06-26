@@ -254,28 +254,100 @@ def test_numeric_only_returns_none():
 # _build_role_updates_from_result — lógica pura sin BD
 # =============================================================================
 
-def test_is_tech_false_sets_role_null_not_deactivate():
+def test_is_tech_false_with_other_sets_null():
     """
-    is_tech=False → role_category=NULL para revisión manual.
-    NUNCA debe tocar is_active. El UPDATE es sobre role_category.
+    is_tech=False + role_category='other' → se marca NULL para revisión manual.
+    'other' no es una categoría técnica fiable, así que sí se permite el cambio.
     """
     job = {"id": 1, "title": "Nurse", "role_category": "other"}
     result = {"role_category": "other", "skills": [], "is_tech": False}
 
     role_updates, skill_records = _build_role_updates_from_result(
-        job=job,
-        result=result,
-        reclassify_all=False,
-        existing_skills=set(),
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
     )
 
     assert (None, 1) in role_updates, "role_category debe ponerse a NULL"
-    assert skill_records == [], "No deben añadirse skills"
-    # El UPDATE es (None, job_id) — nunca (False, job_id) sobre is_active
-    for update in role_updates:
-        assert update[0] in (None,) + tuple(
-            v for v in ["data_engineering", "backend", "other", None]
-        ), "Solo se actualiza role_category"
+    assert skill_records == []
+
+
+def test_is_tech_false_with_null_category_sets_null():
+    """
+    is_tech=False + role_category=None → se marca NULL (sin categoría previa que proteger).
+    """
+    job = {"id": 2, "role_category": None}
+    result = {"role_category": None, "skills": [], "is_tech": False}
+
+    role_updates, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+
+    assert (None, 2) in role_updates
+    assert skill_records == []
+
+
+def test_is_tech_false_with_backend_does_not_overwrite():
+    """
+    is_tech=False + role_category='backend' → NO debe sobrescribir la categoría.
+    Ollama puede dar falsos negativos; si la oferta ya tenía categoría técnica válida,
+    se conserva y no se registra ningún UPDATE.
+    """
+    job = {"id": 3, "role_category": "backend"}
+    result = {"role_category": "other", "skills": ["Python"], "is_tech": False}
+
+    role_updates, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+
+    assert role_updates == [], "No debe generarse ningún UPDATE sobre role_category"
+    assert skill_records == [], "No deben añadirse skills cuando is_tech=False"
+
+
+def test_is_tech_false_with_fullstack_does_not_overwrite():
+    """
+    is_tech=False + role_category='fullstack' → categoría técnica válida se conserva.
+    """
+    job = {"id": 4, "role_category": "fullstack"}
+    result = {"role_category": "other", "skills": ["React", "Node.js"], "is_tech": False}
+
+    role_updates, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+
+    assert role_updates == []
+    assert skill_records == []
+
+
+def test_is_tech_false_with_sysadmin_does_not_overwrite():
+    """
+    is_tech=False + role_category='sysadmin' → categoría técnica válida se conserva.
+    Cubre el caso real observado en las 3 filas 'sysadmin' del SQLite.
+    """
+    job = {"id": 5, "role_category": "sysadmin"}
+    result = {"role_category": None, "skills": [], "is_tech": False}
+
+    role_updates, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+
+    assert role_updates == []
+    assert skill_records == []
+
+
+def test_is_tech_false_no_skills_added_even_with_valid_category():
+    """
+    Cuando is_tech=False, nunca se añaden skills independientemente de la categoría previa.
+    """
+    for role_before in ("backend", "fullstack", "sysadmin", "management", "other", None):
+        job = {"id": 10, "role_category": role_before}
+        result = {"role_category": "backend", "skills": ["Python", "Docker"], "is_tech": False}
+
+        _, skill_records = _build_role_updates_from_result(
+            job=job, result=result, reclassify_all=False, existing_skills=set(),
+        )
+
+        assert skill_records == [], (
+            f"No deben añadirse skills cuando is_tech=False (role_before={role_before!r})"
+        )
 
 
 def test_is_tech_true_updates_category():

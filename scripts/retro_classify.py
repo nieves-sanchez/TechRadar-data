@@ -194,9 +194,13 @@ def _build_role_updates_from_result(
     skill_records: list[dict] = []
     job_id = job["id"]
 
-    # is_tech=False → NULL para revisión manual (NUNCA is_active=False ni DELETE)
+    # is_tech=False — comportamiento conservador para evitar falsos negativos de Ollama:
+    # - Si no hay categoría fiable (NULL o 'other') → marcar NULL para revisión manual.
+    # - Si ya existe una categoría técnica válida → conservarla; no añadir skills.
     if not result.get("is_tech", True):
-        role_updates.append((None, job_id))
+        role_before = job.get("role_category")
+        if role_before is None or role_before == "other":
+            role_updates.append((None, job_id))
         return role_updates, skill_records
 
     cat = result.get("role_category")
