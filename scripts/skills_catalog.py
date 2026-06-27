@@ -66,7 +66,9 @@ SKILLS: list[tuple[str, str, list[str]]] = [
     ("FastAPI",      "framework", [r"\bfastapi\b"]),
     ("Flask",        "framework", [r"\bflask\b"]),
     ("Spring",       "framework", [r"\bspring\s+boot\b", r"\bspring\b"]),
-    ("Node.js",      "framework", [r"\bnode\.?js\b"]),
+    # r"\bnode\b" cubre el alias bare "Node"/"node" que Ollama suele devolver;
+    # word boundary excluye node_exporter, nodepool, nodeport (underscore/letra = no boundary)
+    ("Node.js",      "framework", [r"\bnode\.?js\b", r"\bnode\b"]),
     ("Pandas",       "framework", [r"\bpandas\b"]),
     ("Polars",       "framework", [r"\bpolars\b"]),
     ("NumPy",        "framework", [r"\bnumpy\b"]),

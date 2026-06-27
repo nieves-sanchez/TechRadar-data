@@ -200,15 +200,15 @@ def test_select_truncates_to_limit():
 
 def test_react_variants_all_normalize_to_canonical():
     """
-    Las variantes más comunes de React deben normalizarse al nombre canónico.
-    Evita duplicados tipo React/react/React.js/React JS en la tabla skills.
+    Todas las variantes comunes de React normalizan al nombre canonico.
+    Cubre: react, React, React.js, react.js, React JS, reactjs.
     """
-    variants = ("react", "React.js", "react.js", "React JS", "React")
+    variants = ("react", "React.js", "react.js", "React JS", "React", "reactjs")
     for raw in variants:
         result = _normalize_skill(raw)
-        assert result is not None, f"'{raw}' debería ser válida"
+        assert result is not None, f"'{raw}' deberia ser valida"
         canonical, _ = result
-        assert canonical == "React", f"'{raw}' → esperado 'React', obtenido '{canonical}'"
+        assert canonical == "React", f"'{raw}' -> esperado 'React', obtenido '{canonical}'"
 
 
 def test_python_normalizes():
@@ -417,8 +417,12 @@ def test_other_not_updated_in_default_mode():
     assert role_updates == []
 
 
-def test_other_is_updated_in_reclassify_all_mode():
-    """En modo --all, 'other' SÍ se escribe para sobrescribir clasificaciones previas."""
+def test_reclassify_all_without_update_flag_conserves_valid():
+    """
+    reclassify_all=True sin --update-existing-roles: incluso en modo --all,
+    una categoria valida existente se conserva (modo conservador por defecto).
+    El flag --update-existing-roles es el unico mecanismo para permitir el cambio.
+    """
     job = {"id": 6, "role_category": "backend"}
     result = {"role_category": "other", "skills": [], "is_tech": True}
 
@@ -427,8 +431,186 @@ def test_other_is_updated_in_reclassify_all_mode():
         result=result,
         reclassify_all=True,
         existing_skills=set(),
+        update_existing_roles=False,
+    )
+    assert role_updates == [], "backend existente se conserva incluso con reclassify_all"
+
+
+def test_reclassify_all_with_update_flag_allows_other():
+    """
+    reclassify_all=True + update_existing_roles=True: permite escribir 'other'
+    sobre una categoria valida existente (modo explicitamente no conservador).
+    """
+    job = {"id": 6, "role_category": "backend"}
+    result = {"role_category": "other", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job,
+        result=result,
+        reclassify_all=True,
+        existing_skills=set(),
+        update_existing_roles=True,
     )
     assert ("other", 6) in role_updates
+
+
+# =============================================================================
+# Conservadurismo de role_category (--update-existing-roles)
+# =============================================================================
+
+def test_valid_role_not_overwritten_without_update_flag():
+    """
+    Sin --update-existing-roles, Ollama no puede cambiar una categoria valida
+    aunque proponga otra diferente (ej: backend -> cloud queda sin efecto).
+    """
+    job = {"id": 11, "role_category": "backend"}
+    result = {"role_category": "cloud", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+        update_existing_roles=False,
+    )
+    assert role_updates == [], "backend -> cloud bloqueado en modo conservador"
+
+
+def test_valid_role_overwritten_with_update_flag():
+    """
+    Con --update-existing-roles, Ollama puede cambiar una categoria valida
+    a otra categoria valida (ej: backend -> cloud se permite).
+    """
+    job = {"id": 12, "role_category": "backend"}
+    result = {"role_category": "cloud", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+        update_existing_roles=True,
+    )
+    assert ("cloud", 12) in role_updates
+
+
+def test_null_category_updated_without_flag():
+    """
+    role_before=None -> la categoria propuesta por Ollama siempre se escribe,
+    incluso sin el flag (no hay categoria previa que proteger).
+    """
+    job = {"id": 13, "role_category": None}
+    result = {"role_category": "data_analyst", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+    assert ("data_analyst", 13) in role_updates
+
+
+def test_other_category_upgraded_without_flag():
+    """
+    role_before='other' -> Ollama puede mejorar a categoria especifica
+    sin el flag (porque 'other' no es una categoria tecnica fiable).
+    """
+    job = {"id": 14, "role_category": "other"}
+    result = {"role_category": "backend", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+    assert ("backend", 14) in role_updates
+
+
+def test_skills_added_even_when_role_is_conserved():
+    """
+    Cuando el modo conservador bloquea el cambio de role_category,
+    las skills propuestas por Ollama se canonicalizan y añaden de igual modo.
+    """
+    job = {"id": 15, "role_category": "backend"}
+    result = {"role_category": "cloud", "skills": ["Python", "Docker"], "is_tech": True}
+
+    role_updates, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+        update_existing_roles=False,
+    )
+
+    assert role_updates == [], "role no debe cambiar en modo conservador"
+    skill_names = {r["skill_name"] for r in skill_records}
+    assert "Python" in skill_names, "Python debe añadirse aunque el role se conserve"
+    assert "Docker" in skill_names, "Docker debe añadirse aunque el role se conserve"
+
+
+def test_noncanonical_role_category_rejected():
+    """
+    Una role_category no canonica devuelta por Ollama se descarta silenciosamente.
+    Defensa en profundidad: ai_classifier ya valida, pero _build_role_updates_from_result
+    garantiza que nunca se escriba una categoria fuera de VALID_CATEGORIES.
+    """
+    job = {"id": 16, "role_category": None}
+    result = {"role_category": "illegal_category", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+    assert role_updates == [], "categoria no canonica no debe generar ningun UPDATE"
+
+
+def test_role_after_reflects_conserved_category():
+    """
+    Cuando el modo conservador previene la actualizacion, role_updates esta vacio.
+    El llamador calcula role_after = role_updates[0][0] if role_updates else role_before,
+    lo que garantiza que role_category_after en SQLite sea la categoria real (la anterior).
+    """
+    job = {"id": 17, "role_category": "management"}
+    result = {"role_category": "cloud", "skills": [], "is_tech": True}
+
+    role_updates, _ = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+        update_existing_roles=False,
+    )
+
+    role_before = job["role_category"]
+    role_after = role_updates[0][0] if role_updates else role_before
+    assert role_after == "management", "role_after debe reflejar la categoria conservada"
+
+
+# =============================================================================
+# Canonicalizacion de skills: Node.js y deduplicacion
+# =============================================================================
+
+def test_nodejs_variants_normalize_to_canonical():
+    """
+    Todas las variantes comunes de Node.js normalizan al nombre canonico.
+    Cubre: Node, node (bare), Node.js, node.js, nodejs.
+    El patron r'\bnode\b' cubre los aliases bare; word boundary excluye
+    node_exporter, nodepool, nodeport (underscore/letra adyacente = sin boundary).
+    """
+    variants = ("Node", "node", "Node.js", "node.js", "nodejs")
+    for raw in variants:
+        result = _normalize_skill(raw)
+        assert result is not None, f"'{raw}' deberia ser una skill valida"
+        canonical, _ = result
+        assert canonical == "Node.js", (
+            f"'{raw}' -> esperado 'Node.js', obtenido '{canonical}'"
+        )
+
+
+def test_three_react_variants_produce_one_skill_record():
+    """
+    Si Ollama devuelve tres variantes de React en la misma oferta
+    (react / React / React.js), solo se genera una entrada en skill_records.
+    """
+    job = {"id": 18, "role_category": "frontend"}
+    result = {
+        "role_category": "frontend",
+        "skills": ["react", "React", "React.js"],
+        "is_tech": True,
+    }
+
+    _, skill_records = _build_role_updates_from_result(
+        job=job, result=result, reclassify_all=False, existing_skills=set(),
+    )
+
+    canonical_names = [r["skill_name"] for r in skill_records]
+    assert len(canonical_names) == 1, (
+        f"Esperada 1 skill 'React', obtenido: {canonical_names}"
+    )
+    assert canonical_names[0] == "React"
 
 
 # =============================================================================

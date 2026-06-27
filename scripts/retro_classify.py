@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 from scripts.ai_classifier import (
     DESCRIPTION_LIMIT,
     OLLAMA_MODEL,
+    VALID_CATEGORIES,
     _is_ollama_available,
     classify_batch,
 )
@@ -174,17 +175,31 @@ def _build_role_updates_from_result(
     result: dict,
     reclassify_all: bool,
     existing_skills: set[str],
+    update_existing_roles: bool = False,
 ) -> tuple[list, list]:
     """
     Extrae role_updates y skill_records de un resultado de Ollama.
 
     No toca la BD. Separado para ser testeado sin conexión a Supabase.
 
+    Modo conservador por defecto (update_existing_roles=False):
+      - is_tech=False + role_before valido    -> conserva categoria, no añade skills.
+      - is_tech=False + role_before NULL/other -> pone NULL para revision manual.
+      - is_tech=True  + role_before valido    -> NO cambia role_category, si añade skills.
+      - is_tech=True  + role_before NULL/other -> actualiza role_category si es canonica.
+
+    Con update_existing_roles=True:
+      - is_tech=True permite sobrescribir una categoria valida existente.
+
+    En todos los casos, role_category propuesta se valida contra VALID_CATEGORIES
+    antes de escribir (defensa en profundidad sobre la validacion de ai_classifier).
+
     Args:
         job: Dict con claves 'id' y 'role_category'.
         result: Dict con 'role_category', 'skills' e 'is_tech'.
-        reclassify_all: Si True, actualiza aunque la categoría sea 'other'.
+        reclassify_all: Si True, permite escribir 'other' como resultado.
         existing_skills: Set de nombres de skills ya vinculadas (lowercase).
+        update_existing_roles: Si True, permite cambiar una categoria valida existente.
 
     Returns:
         (role_updates, skill_records) listos para pasar a update_role_categories
@@ -193,20 +208,31 @@ def _build_role_updates_from_result(
     role_updates: list[tuple] = []
     skill_records: list[dict] = []
     job_id = job["id"]
+    role_before = job.get("role_category")
 
     # is_tech=False — comportamiento conservador para evitar falsos negativos de Ollama:
-    # - Si no hay categoría fiable (NULL o 'other') → marcar NULL para revisión manual.
-    # - Si ya existe una categoría técnica válida → conservarla; no añadir skills.
+    # - Sin categoria fiable (NULL o 'other') -> marcar NULL para revision manual.
+    # - Con categoria tecnica valida -> conservarla; no anadir skills.
     if not result.get("is_tech", True):
-        role_before = job.get("role_category")
         if role_before is None or role_before == "other":
             role_updates.append((None, job_id))
         return role_updates, skill_records
 
+    # is_tech=True — validar canonicalidad de la categoria propuesta
     cat = result.get("role_category")
-    if cat and (reclassify_all or cat != "other"):
-        role_updates.append((cat, job_id))
+    # Defensa en profundidad: ai_classifier._clean_result ya valida, pero lo
+    # reforzamos aqui para garantizar que nunca se escriba una categoria invalida
+    if cat not in VALID_CATEGORIES:
+        cat = None
 
+    # Modo conservador: no sobreescribir categoria tecnica valida sin flag explicito
+    has_valid_existing = role_before is not None and role_before != "other"
+
+    if cat and (reclassify_all or cat != "other"):
+        if not has_valid_existing or update_existing_roles:
+            role_updates.append((cat, job_id))
+
+    # Anadir skills canonicalizadas independientemente de si se actualizo el rol
     seen = set(existing_skills)
     for raw_skill in result.get("skills", []):
         normalized = _normalize_skill(raw_skill)
@@ -506,6 +532,7 @@ def _process_batch_with_tracking(
     batch: list[dict],
     reclassify_all: bool,
     model: str,
+    update_existing_roles: bool = False,
 ) -> dict:
     """
     Envía un lote de ofertas a Ollama, escribe resultados en BD y registra en SQLite.
@@ -517,8 +544,9 @@ def _process_batch_with_tracking(
         conn: Conexión psycopg2 a Supabase.
         state_conn: Conexión SQLite de tracking.
         batch: Lista de jobs enriquecidos con _hash, _text, _text_source.
-        reclassify_all: Si True, actualiza categorías aunque sean 'other'.
+        reclassify_all: Si True, permite escribir 'other' como resultado.
         model: Nombre del modelo Ollama.
+        update_existing_roles: Si True, permite cambiar una categoria valida existente.
 
     Returns:
         Dict con claves 'roles_changed', 'skills_added', 'errors'.
@@ -562,6 +590,7 @@ def _process_batch_with_tracking(
                 result=result,
                 reclassify_all=reclassify_all,
                 existing_skills=existing_skills_map.get(job_id, set()),
+                update_existing_roles=update_existing_roles,
             )
 
             all_role_updates.extend(role_updates)
@@ -609,6 +638,7 @@ def run(
     include_inactive: bool = False,
     cleanup_non_it: bool = False,
     confirm_cleanup: bool = False,
+    update_existing_roles: bool = False,
 ) -> None:
     """
     Función principal del Pipeline C.
@@ -628,6 +658,8 @@ def run(
         include_inactive: Si True, incluye is_active=FALSE.
         cleanup_non_it: Ejecutar paso de limpieza por patrones antes de Ollama.
         confirm_cleanup: Aplicar cambios de limpieza (si False, solo dry run).
+        update_existing_roles: Si True, permite cambiar role_category aunque ya
+            tenga una categoria tecnica valida (modo no conservador).
     """
     model = OLLAMA_MODEL
 
@@ -689,7 +721,11 @@ def run(
         logger.info("  Limit (Ollama):   %s", limit if limit > 0 else "sin límite")
         logger.info("  Max minutos:      %s", max_minutes if max_minutes > 0 else "sin límite")
         logger.info("  Batch size:       %d", batch_size)
-        logger.info("  Reprocess:        %s", "sí" if reprocess else "no")
+        logger.info("  Reprocess:        %s", "si" if reprocess else "no")
+        logger.info(
+            "  Roles conservador:%s",
+            "no (--update-existing-roles activo)" if update_existing_roles else "si (default)",
+        )
         logger.info("─" * 60)
         print()
 
@@ -765,7 +801,8 @@ def run(
             for i in range(0, len(to_process), batch_size):
                 sub_batch = to_process[i: i + batch_size]
                 stats = _process_batch_with_tracking(
-                    conn, state_conn, sub_batch, reclassify_all, model
+                    conn, state_conn, sub_batch, reclassify_all, model,
+                    update_existing_roles=update_existing_roles,
                 )
                 processed    += len(sub_batch)
                 total_roles  += stats["roles_changed"]
@@ -894,6 +931,16 @@ Ejemplos:
         help="Aplicar la limpieza a BD (sin este flag, solo muestra recuento).",
     )
 
+    # Conservadurismo de roles
+    parser.add_argument(
+        "--update-existing-roles", action="store_true",
+        help=(
+            "Permitir que Ollama cambie role_category aunque ya tenga una categoria "
+            "tecnica valida. Por defecto (sin este flag) se conserva la categoria "
+            "existente y solo se añaden skills nuevas."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.reclassify_all and args.days > 0:
@@ -914,4 +961,5 @@ Ejemplos:
         include_inactive=args.include_inactive,
         cleanup_non_it=args.cleanup_non_it,
         confirm_cleanup=args.confirm_cleanup,
+        update_existing_roles=args.update_existing_roles,
     )
