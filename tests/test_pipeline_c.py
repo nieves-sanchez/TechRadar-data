@@ -30,6 +30,7 @@ from scripts.ollama_state import (
 from scripts.retro_classify import (
     _build_role_updates_from_result,
     _normalize_skill,
+    _resolve_skill_id_map,
     _select_description,
 )
 
@@ -769,3 +770,157 @@ def test_max_minutes_not_triggered_early():
 
     elapsed_min = (time.monotonic() - t_start) / 60
     assert elapsed_min < max_minutes, "No debería triggear el límite de tiempo"
+
+
+# =============================================================================
+# _resolve_skill_id_map — resolucion de IDs canonicos sin Supabase real
+#
+# Todos los tests usan un cursor mock. Los datos de BD se controlan via
+# cur.fetchall.side_effect: lista de resultados, uno por llamada a fetchall.
+# =============================================================================
+
+def _make_cursor(phase1_rows, phase2_rows=None):
+    """
+    Devuelve un MagicMock de cursor psycopg2.
+    phase1_rows: resultado de la Fase 1 (exact match, siempre se llama).
+    phase2_rows: resultado de la Fase 2 (fallback, solo si hay 'missing').
+                 None indica que la Fase 2 no deberia llamarse.
+    """
+    cur = MagicMock()
+    if phase2_rows is not None:
+        cur.fetchall.side_effect = [phase1_rows, phase2_rows]
+    else:
+        cur.fetchall.side_effect = [phase1_rows]
+    return cur
+
+
+def test_resolve_uses_exact_canonical_react():
+    """
+    BUG ORIGINAL: con 'React' (id=1) y 'react' (id=5) en BD, el LOWER lookup
+    devolvia ambas filas y el dict comprehension elegia no-deterministicamente.
+    NUEVO: la Fase 1 (exact match) encuentra 'React' directamente -> id=1 siempre.
+    """
+    cur = _make_cursor(phase1_rows=[(1, "React")])
+    unique = {"react": ("React", "framework")}
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result == {"react": 1}
+    # Solo se ejecuto Fase 1 (1 execute + 1 fetchall); Fase 2 no fue necesaria
+    assert cur.execute.call_count == 1, "Fase 2 no debe ejecutarse cuando Fase 1 resuelve todo"
+
+
+def test_resolve_uses_exact_canonical_nodejs():
+    """
+    Con 'Node.js' (id=10) y 'node.js' (id=20) en BD, se usa id=10 (canonico).
+    """
+    cur = _make_cursor(phase1_rows=[(10, "Node.js")])
+    unique = {"node.js": ("Node.js", "framework")}
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result == {"node.js": 10}
+    assert cur.execute.call_count == 1
+
+
+def test_resolve_fallback_when_no_exact_match():
+    """
+    Si el nombre canonico no existe en BD (Fase 1 vacia), la Fase 2 resuelve
+    via LOWER lookup con el unico candidato disponible.
+    """
+    cur = _make_cursor(
+        phase1_rows=[],
+        phase2_rows=[(5, "react", "react")],
+    )
+    unique = {"react": ("React", "framework")}
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result == {"react": 5}
+    assert cur.execute.call_count == 2, "Fase 2 debe ejecutarse cuando Fase 1 no resuelve"
+
+
+def test_resolve_fallback_prefers_canonical_among_aliases():
+    """
+    Fase 2 con multiples candidatos para el mismo lower_name:
+    si uno coincide exactamente con el canonico, se prefiere ese.
+    ('React' id=1 preferido sobre 'react' id=5 en el fallback)
+    """
+    cur = _make_cursor(
+        phase1_rows=[],
+        phase2_rows=[
+            (5, "react", "react"),
+            (1, "React", "react"),
+        ],
+    )
+    unique = {"react": ("React", "framework")}
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result == {"react": 1}, "React (canonico) debe preferirse sobre react (alias)"
+
+
+def test_resolve_fallback_uses_min_id_when_no_exact_canonical():
+    """
+    Fase 2 con multiples aliases, ninguno coincide con el canonico:
+    se usa el de menor id (fila mas antigua, mas estable).
+    """
+    cur = _make_cursor(
+        phase1_rows=[],
+        phase2_rows=[
+            (7, "REACT", "react"),
+            (3, "rEact", "react"),
+        ],
+    )
+    unique = {"react": ("React", "framework")}
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result == {"react": 3}, "Debe usarse el id minimo cuando no hay coincidencia exacta"
+
+
+def test_resolve_multiple_skills_mixed():
+    """
+    Con varias skills, algunas resueltas en Fase 1 y otras en Fase 2.
+    Python resuelto en exacto; docker (alias 'Docker') requiere fallback.
+    """
+    cur = _make_cursor(
+        phase1_rows=[(42, "Python")],
+        phase2_rows=[(99, "docker", "docker")],
+    )
+    unique = {
+        "python": ("Python", "language"),
+        "docker": ("Docker", "cloud"),
+    }
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    assert result["python"] == 42
+    assert result["docker"] == 99
+    assert cur.execute.call_count == 2  # ambas fases ejecutadas
+
+
+def test_resolve_empty_input_returns_empty():
+    """Input vacio no ejecuta ninguna consulta."""
+    cur = _make_cursor(phase1_rows=[])
+    result = _resolve_skill_id_map(cur, {})
+    assert result == {}
+    cur.execute.assert_not_called()
+
+
+def test_resolve_no_duplicate_job_skills():
+    """
+    Si el mismo (job_id, skill_id) ya existe en job_skills, ON CONFLICT DO NOTHING
+    impide duplicados. Verificamos que _resolve_skill_id_map no genera IDs duplicados
+    para el mismo lower_name (lo que causaria intentos de insercion duplicados).
+    """
+    # Dos skill_records con el mismo nombre canonico (mismo lower_name)
+    # Fase 1 devuelve React una sola vez
+    cur = _make_cursor(phase1_rows=[(1, "React")])
+    unique = {"react": ("React", "framework")}  # dedup ya hecho antes de llegar aqui
+
+    result = _resolve_skill_id_map(cur, unique)
+
+    # Un solo entry en el mapa — no puede generar links duplicados
+    assert len(result) == 1
+    assert result["react"] == 1

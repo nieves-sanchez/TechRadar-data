@@ -461,25 +461,93 @@ def update_role_categories(cur, updates: list[tuple]) -> None:
         )
 
 
+def _resolve_skill_id_map(
+    cur,
+    unique_skills: dict[str, tuple[str, str]],
+) -> dict[str, int]:
+    """
+    Resuelve {lower_name -> skill_id} garantizando siempre el ID canonico exacto.
+
+    Estrategia en dos fases:
+
+    Fase 1 — exact match (name = ANY(canonical_names)):
+        Tras el INSERT previo con ON CONFLICT (name) DO NOTHING, cada nombre
+        canonico debe existir en BD. Esta consulta lo encuentra de forma
+        determinista: si 'React' (id=1) y 'react' (id=5) coexisten en BD,
+        solo 'React' aparece aqui -> id=1 siempre, sin ambiguedad de orden.
+
+    Fase 2 — fallback case-insensitive (solo para lower_names no resueltos):
+        No deberia ejecutarse para skills del catalogo (la fase 1 las encuentra
+        todas). Actua de defensa para skills libres cuyo nombre exacto no se
+        encontro. Si hay multiples candidatos para el mismo lower_name:
+        - Se prefiere el que coincide exactamente con el nombre canonico.
+        - Si ninguno coincide, se usa el de menor id (fila mas antigua).
+
+    Args:
+        cur: Cursor psycopg2 activo (ejecuta hasta 2 SELECT).
+        unique_skills: {lower_name: (canonical_name, category)}.
+
+    Returns:
+        {lower_name: skill_id}. Puede tener menos entradas que unique_skills
+        si algun nombre no se resuelve (no deberia ocurrir tras INSERT).
+    """
+    if not unique_skills:
+        return {}
+
+    canonical_names = [v[0] for v in unique_skills.values()]
+
+    # Fase 1: exact match por nombre canonico — determinista, no depende de orden
+    cur.execute(
+        "SELECT id, name FROM skills WHERE name = ANY(%s)",
+        (canonical_names,),
+    )
+    skill_id_map: dict[str, int] = {}
+    for row in cur.fetchall():
+        skill_id_map[row[1].lower()] = row[0]
+
+    # Fase 2: fallback case-insensitive para cualquier lower_name no resuelto
+    missing = [k for k in unique_skills if k not in skill_id_map]
+    if missing:
+        cur.execute(
+            "SELECT id, name, LOWER(name) AS lname FROM skills WHERE LOWER(name) = ANY(%s)",
+            (missing,),
+        )
+        candidates: dict[str, list[tuple[int, str]]] = {}
+        for row in cur.fetchall():
+            candidates.setdefault(row[2], []).append((row[0], row[1]))
+
+        for lname, rows in candidates.items():
+            canonical = unique_skills[lname][0]
+            # Preferir la fila cuyo name coincide exactamente con el canonico
+            exact = [r for r in rows if r[1] == canonical]
+            if exact:
+                skill_id_map[lname] = exact[0][0]
+            else:
+                # Sin coincidencia exacta: usar el id mas bajo (fila mas antigua)
+                skill_id_map[lname] = min(rows, key=lambda r: r[0])[0]
+
+    return skill_id_map
+
+
 def upsert_skills_and_links(cur, skill_records: list[dict]) -> int:
     """
-    Inserta skills nuevas (con lookup case-insensitive) y crea vínculos job_skills.
+    Inserta skills nuevas (con nombre canonico) y crea vinculos job_skills.
 
-    Evita duplicados tipo 'React'/'react'/'React.js': tras normalización, todas
-    llegan aquí como 'React'. El SELECT LOWER(name) cubre el caso residual de
-    skills no-catálogo con variantes de capitalización ya en BD.
+    Garantiza que siempre se usa el ID exacto del nombre canonico ('React',
+    'Node.js', ...) mediante resolucion en dos fases: exact-match primero,
+    fallback case-insensitive solo si el exacto falla. Ver _resolve_skill_id_map.
 
     Args:
         skill_records: lista de {job_id, skill_name, skill_category}.
 
     Returns:
-        Número de vínculos job_skills insertados.
+        Numero de vinculos job_skills insertados.
     """
     if not skill_records:
         return 0
 
     # Dedup por nombre normalizado
-    unique_skills: dict[str, str] = {}  # lower_name → (canonical_name, category)
+    unique_skills: dict[str, tuple[str, str]] = {}  # lower_name -> (canonical, category)
     for r in skill_records:
         nm = r["skill_name"][:80].strip()
         if nm:
@@ -488,22 +556,17 @@ def upsert_skills_and_links(cur, skill_records: list[dict]) -> int:
     if not unique_skills:
         return 0
 
-    # Insertar skills nuevas (el UNIQUE constraint en name es case-sensitive en PG)
+    # Insertar skills nuevas con nombre canonico exacto
     psycopg2.extras.execute_values(
         cur,
         "INSERT INTO skills (name, category) VALUES %s ON CONFLICT (name) DO NOTHING",
         list(unique_skills.values()),
     )
 
-    # Recuperar IDs via lookup case-insensitive — cubre variantes no normalizadas
-    lower_list = list(unique_skills.keys())
-    cur.execute(
-        "SELECT id, LOWER(name) AS lname FROM skills WHERE LOWER(name) = ANY(%s)",
-        (lower_list,),
-    )
-    skill_id_map: dict[str, int] = {row[1]: row[0] for row in cur.fetchall()}
+    # Resolver IDs: exact-first para evitar aliases historicos no canonicos
+    skill_id_map = _resolve_skill_id_map(cur, unique_skills)
 
-    # Construir vínculos
+    # Construir vinculos
     links = []
     for r in skill_records:
         nm = r["skill_name"][:80].strip()
