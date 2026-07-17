@@ -11,6 +11,7 @@ Cubre:
 - Limpieza non-IT no se ejecuta por defecto
 - --limit cuenta envíos reales a Ollama (no candidatos leídos)
 - --max-minutes para limpiamente tras el batch en curso
+- Robustez frente a desconexiones Supabase: retry, ordering SQLite/Supabase, salida limpia
 
 No llama a Ollama real ni conecta a Supabase.
 """
@@ -19,6 +20,7 @@ import sqlite3
 import time
 from unittest.mock import MagicMock, call, patch
 
+import psycopg2
 import pytest
 
 from scripts.ollama_state import (
@@ -30,6 +32,7 @@ from scripts.ollama_state import (
 from scripts.retro_classify import (
     _build_role_updates_from_result,
     _normalize_skill,
+    _process_batch_with_tracking,
     _resolve_skill_id_map,
     _select_description,
 )
@@ -924,3 +927,217 @@ def test_resolve_no_duplicate_job_skills():
     # Un solo entry en el mapa — no puede generar links duplicados
     assert len(result) == 1
     assert result["react"] == 1
+
+
+# =============================================================================
+# Robustez frente a desconexiones Supabase
+# =============================================================================
+
+def _make_pg_conn_mock(commit_raises=False):
+    """
+    Devuelve un mock mínimo de conexión psycopg2.
+
+    Las funciones que usan el cursor directamente (get_existing_skills_for_jobs,
+    update_role_categories, upsert_skills_and_links) deben parchearse por separado
+    en los tests que usan este helper, para evitar que psycopg2.extras.execute_batch
+    intente llamar cur.mogrify() sobre un MagicMock.
+    """
+    mock_conn = MagicMock()
+    if commit_raises:
+        mock_conn.commit.side_effect = psycopg2.OperationalError(
+            "server closed the connection unexpectedly"
+        )
+    return mock_conn
+
+
+_FAKE_BATCH = [{
+    "id": 42,
+    "title": "Dev",
+    "role_category": None,
+    "_hash": "deadbeef12345678",
+    "_text": "Python developer",
+    "_text_source": "description_short",
+}]
+
+_FAKE_RESULT = [{"role_category": "backend", "skills": ["Python"], "is_tech": True}]
+
+# Parches comunes para las funciones que escriben en Supabase.
+# Necesario porque psycopg2.extras.execute_batch/execute_values llaman a
+# cur.mogrify() que no funciona sobre un MagicMock.
+_SUPABASE_WRITE_PATCHES = {
+    "scripts.retro_classify.get_existing_skills_for_jobs": MagicMock(
+        return_value={42: set()}
+    ),
+    "scripts.retro_classify.update_role_categories": MagicMock(return_value=None),
+    "scripts.retro_classify.upsert_skills_and_links": MagicMock(return_value=1),
+}
+
+
+def test_sqlite_not_marked_if_supabase_commit_fails():
+    """
+    Si conn.commit() lanza OperationalError, SQLite NO debe marcar la oferta
+    como 'processed'. El llamador puede reconectar y reintentar de forma segura.
+
+    Verifica la garantía de ordering: SQLite solo se actualiza después del commit
+    de Supabase, no antes.
+    """
+    state_conn = open_state_db(":memory:")
+    mock_conn = _make_pg_conn_mock(commit_raises=True)
+
+    with patch("scripts.retro_classify.classify_batch", return_value=_FAKE_RESULT), \
+         patch("scripts.retro_classify.get_existing_skills_for_jobs", return_value={42: set()}), \
+         patch("scripts.retro_classify.update_role_categories"), \
+         patch("scripts.retro_classify.upsert_skills_and_links", return_value=1):
+        with pytest.raises(psycopg2.OperationalError):
+            _process_batch_with_tracking(
+                mock_conn, state_conn, _FAKE_BATCH, False, "test-model"
+            )
+
+    assert not is_already_processed(state_conn, 42, "deadbeef12345678", "test-model"), (
+        "SQLite no debe marcar la oferta como processed si Supabase no commitió"
+    )
+    state_conn.close()
+
+
+def test_process_batch_propagates_db_connection_error():
+    """
+    psycopg2.OperationalError/InterfaceError durante Supabase se propaga al llamador
+    en lugar de ser silenciada. Esto permite a run() reconectar y reintentar.
+    """
+    state_conn = open_state_db(":memory:")
+    mock_conn = _make_pg_conn_mock(commit_raises=True)
+
+    with patch("scripts.retro_classify.classify_batch", return_value=_FAKE_RESULT), \
+         patch("scripts.retro_classify.get_existing_skills_for_jobs", return_value={42: set()}), \
+         patch("scripts.retro_classify.update_role_categories"), \
+         patch("scripts.retro_classify.upsert_skills_and_links", return_value=1):
+        with pytest.raises((psycopg2.OperationalError, psycopg2.InterfaceError)):
+            _process_batch_with_tracking(
+                mock_conn, state_conn, _FAKE_BATCH, False, "test-model"
+            )
+
+    state_conn.close()
+
+
+def test_sqlite_written_exactly_once_after_retry():
+    """
+    Tras un primer intento fallido y un retry exitoso:
+    - El primer intento (Supabase no commitió) no escribe en SQLite.
+    - El segundo intento escribe exactamente 1 registro 'processed'.
+    - No hay entradas duplicadas.
+    """
+    state_conn = open_state_db(":memory:")
+
+    commit_calls = {"n": 0}
+
+    def mock_commit():
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise psycopg2.OperationalError("server closed")
+
+    mock_conn = _make_pg_conn_mock()
+    mock_conn.commit.side_effect = mock_commit
+
+    with patch("scripts.retro_classify.classify_batch", return_value=_FAKE_RESULT), \
+         patch("scripts.retro_classify.get_existing_skills_for_jobs", return_value={42: set()}), \
+         patch("scripts.retro_classify.update_role_categories"), \
+         patch("scripts.retro_classify.upsert_skills_and_links", return_value=1):
+
+        # Primer intento: lanza OperationalError
+        with pytest.raises(psycopg2.OperationalError):
+            _process_batch_with_tracking(
+                mock_conn, state_conn, _FAKE_BATCH, False, "test-model"
+            )
+
+        # SQLite todavía limpio
+        assert not is_already_processed(state_conn, 42, "deadbeef12345678", "test-model"), (
+            "Tras el primer intento fallido, SQLite debe permanecer limpio"
+        )
+
+        # Segundo intento: commit tiene éxito
+        _process_batch_with_tracking(
+            mock_conn, state_conn, _FAKE_BATCH, False, "test-model"
+        )
+
+    # Exactamente 1 registro processed (INSERT OR REPLACE garantiza sin duplicados)
+    count = state_conn.execute(
+        "SELECT COUNT(*) FROM ollama_reviews WHERE job_id = 42 AND status = 'processed'"
+    ).fetchone()[0]
+    assert count == 1, f"Esperado 1 registro 'processed', obtenido {count}"
+    assert is_already_processed(state_conn, 42, "deadbeef12345678", "test-model")
+    assert commit_calls["n"] == 2
+
+    state_conn.close()
+
+
+def test_run_retries_batch_on_db_disconnection(tmp_path):
+    """
+    run() reconecta a Supabase y reintenta el batch cuando _process_batch_with_tracking
+    lanza psycopg2.OperationalError. El batch se procesa exitosamente en el segundo intento.
+    """
+    attempt_count = {"n": 0}
+
+    def fake_process_batch(conn, state_conn, batch, reclassify_all, model, **kwargs):
+        attempt_count["n"] += 1
+        if attempt_count["n"] == 1:
+            raise psycopg2.OperationalError("server closed the connection unexpectedly")
+        return {"roles_changed": 1, "skills_added": 0, "errors": 0}
+
+    state_path = str(tmp_path / "state.sqlite")
+    job = {
+        "id": 10, "title": "Dev", "role_category": None,
+        "description_full": "Python developer", "description_short": None,
+    }
+
+    get_conn_calls = {"n": 0}
+
+    def make_conn():
+        get_conn_calls["n"] += 1
+        return MagicMock()
+
+    with patch("scripts.retro_classify._is_ollama_available", return_value=True), \
+         patch("scripts.retro_classify.classify_batch", return_value=[
+             {"role_category": "backend", "skills": [], "is_tech": True}
+         ]), \
+         patch("scripts.retro_classify._get_connection", side_effect=make_conn), \
+         patch("scripts.retro_classify.count_candidates", return_value=1), \
+         patch("scripts.retro_classify.fetch_jobs_page", side_effect=[[job], []]), \
+         patch("scripts.retro_classify._process_batch_with_tracking",
+               side_effect=fake_process_batch):
+        from scripts.retro_classify import run
+        run(days=2, yes=True, state_path=state_path, db_retries=1)
+
+    assert attempt_count["n"] == 2, (
+        f"El batch debe haberse intentado 2 veces (1 fallo + 1 éxito), "
+        f"obtenido: {attempt_count['n']}"
+    )
+    assert get_conn_calls["n"] == 2, (
+        f"Debe haberse reconectado (_get_connection llamado 2 veces: "
+        f"1 inicial + 1 reconexión), obtenido: {get_conn_calls['n']}"
+    )
+
+
+def test_run_exits_cleanly_after_max_retries(tmp_path):
+    """
+    Si la desconexión persiste más allá de db_retries, run() termina limpiamente
+    sin relanzar la excepción (sin traceback). El mensaje indica que es seguro
+    relanzar el mismo comando.
+    """
+    state_path = str(tmp_path / "state.sqlite")
+    job = {
+        "id": 11, "title": "Dev", "role_category": None,
+        "description_full": "Python", "description_short": None,
+    }
+
+    with patch("scripts.retro_classify._is_ollama_available", return_value=True), \
+         patch("scripts.retro_classify.classify_batch", return_value=[
+             {"role_category": "backend", "skills": [], "is_tech": True}
+         ]), \
+         patch("scripts.retro_classify._get_connection", return_value=MagicMock()), \
+         patch("scripts.retro_classify.count_candidates", return_value=1), \
+         patch("scripts.retro_classify.fetch_jobs_page", side_effect=[[job], []]), \
+         patch("scripts.retro_classify._process_batch_with_tracking",
+               side_effect=psycopg2.OperationalError("server closed")):
+        from scripts.retro_classify import run
+        # NO debe lanzar excepción — salida controlada
+        run(days=2, yes=True, state_path=state_path, db_retries=0)

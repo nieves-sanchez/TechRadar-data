@@ -261,6 +261,22 @@ def _get_connection():
     return psycopg2.connect(DATABASE_URL)
 
 
+def _reconnect_supabase(old_conn):
+    """Cierra una conexión Supabase rota y devuelve una nueva conexión limpia."""
+    try:
+        old_conn.rollback()
+    except Exception:
+        pass
+    try:
+        old_conn.close()
+    except Exception:
+        pass
+    logger.info("Reconectando a Supabase...")
+    new_conn = _get_connection()
+    logger.info("Reconexión establecida.")
+    return new_conn
+
+
 # =============================================================================
 # Limpieza por patrones (solo con --cleanup-non-it)
 # =============================================================================
@@ -637,6 +653,10 @@ def _process_batch_with_tracking(
         return stats
 
     job_ids = [j["id"] for j in batch]
+    # Acumular registros SQLite para escribirlos DESPUÉS del commit de Supabase.
+    # Garantía: si Supabase falla antes del commit, SQLite permanece limpio y el
+    # batch puede reintentarse sin marcar falsas completaciones ni duplicar datos.
+    pending_sqlite: list[dict] = []
 
     with conn.cursor() as cur:
         existing_skills_map = get_existing_skills_for_jobs(cur, job_ids)
@@ -665,23 +685,29 @@ def _process_batch_with_tracking(
             if role_updates:
                 stats["roles_changed"] += 1
 
-            record_result(
-                state_conn,
-                job_id=job_id,
-                input_hash=job["_hash"],
-                model=model,
-                text_source=job["_text_source"],
-                status="processed",
-                role_category_before=role_before,
-                role_category_after=role_after,
-                skills_before_count=skills_before_count,
-                skills_added=skills_n,
-            )
+            pending_sqlite.append({
+                "job_id": job_id,
+                "input_hash": job["_hash"],
+                "model": model,
+                "text_source": job["_text_source"],
+                "status": "processed",
+                "role_category_before": role_before,
+                "role_category_after": role_after,
+                "skills_before_count": skills_before_count,
+                "skills_added": skills_n,
+            })
 
         update_role_categories(cur, all_role_updates)
         stats["skills_added"] = upsert_skills_and_links(cur, all_skill_records)
 
+    # Supabase commit primero: si lanza OperationalError/InterfaceError, la excepción
+    # propaga al llamador y SQLite permanece limpio (pending_sqlite no se procesa).
     conn.commit()
+
+    # Solo tras commit exitoso, registrar en SQLite.
+    for kwargs in pending_sqlite:
+        record_result(state_conn, **kwargs)
+
     return stats
 
 
@@ -702,6 +728,7 @@ def run(
     cleanup_non_it: bool = False,
     confirm_cleanup: bool = False,
     update_existing_roles: bool = False,
+    db_retries: int = 2,
 ) -> None:
     """
     Función principal del Pipeline C.
@@ -723,6 +750,7 @@ def run(
         confirm_cleanup: Aplicar cambios de limpieza (si False, solo dry run).
         update_existing_roles: Si True, permite cambiar role_category aunque ya
             tenga una categoria tecnica valida (modo no conservador).
+        db_retries: Reintentos de conexión Supabase por batch (por defecto 2).
     """
     model = OLLAMA_MODEL
 
@@ -863,10 +891,38 @@ def run(
             # Procesar en sub-lotes de batch_size
             for i in range(0, len(to_process), batch_size):
                 sub_batch = to_process[i: i + batch_size]
-                stats = _process_batch_with_tracking(
-                    conn, state_conn, sub_batch, reclassify_all, model,
-                    update_existing_roles=update_existing_roles,
-                )
+
+                last_db_error: Exception | None = None
+                for db_attempt in range(db_retries + 1):
+                    try:
+                        stats = _process_batch_with_tracking(
+                            conn, state_conn, sub_batch, reclassify_all, model,
+                            update_existing_roles=update_existing_roles,
+                        )
+                        last_db_error = None
+                        break
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                        last_db_error = exc
+                        logger.warning(
+                            "Desconexión Supabase (intento %d/%d): %s",
+                            db_attempt + 1, db_retries + 1, exc,
+                        )
+                        if db_attempt < db_retries:
+                            try:
+                                conn = _reconnect_supabase(conn)
+                            except Exception as reconnect_exc:
+                                logger.warning("Reconexión fallida: %s", reconnect_exc)
+                                break
+
+                if last_db_error is not None:
+                    logger.error(
+                        "Conexión Supabase perdida tras %d reintento(s). "
+                        "Es seguro relanzar el mismo comando; las ofertas "
+                        "ya procesadas se saltarán por SQLite.",
+                        db_retries,
+                    )
+                    return
+
                 processed    += len(sub_batch)
                 total_roles  += stats["roles_changed"]
                 total_skills += stats["skills_added"]
@@ -909,7 +965,10 @@ def run(
         logger.info("=" * 60)
 
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
         state_conn.close()
 
 
@@ -1003,6 +1062,13 @@ Ejemplos:
             "existente y solo se añaden skills nuevas."
         ),
     )
+    parser.add_argument(
+        "--db-retries", type=int, default=2, metavar="N",
+        help=(
+            "Reintentos de conexión Supabase por batch si se produce "
+            "OperationalError/InterfaceError (por defecto 2)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1025,4 +1091,5 @@ Ejemplos:
         cleanup_non_it=args.cleanup_non_it,
         confirm_cleanup=args.confirm_cleanup,
         update_existing_roles=args.update_existing_roles,
+        db_retries=args.db_retries,
     )
