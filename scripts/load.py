@@ -4,6 +4,7 @@ load.py — Carga de datos en PostgreSQL (Supabase) para TechRadar.
 Implementa la estrategia UPSERT incremental sobre la tabla jobs:
   - Ofertas nuevas se insertan con is_active=TRUE
   - Ofertas ya existentes actualizan last_seen_at y sus campos de contenido
+  - description_full se conserva si la nueva ingesta no trae valor (ver DQ-14)
   - Si una oferta fue marcada inactiva y reaparece en la API, se reactiva
   - Tras cada carga se marcan como is_active=FALSE las ofertas con
     posted_at anterior a INACTIVE_AFTER_DAYS dias
@@ -33,6 +34,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 INACTIVE_AFTER_DAYS = 90
 BATCH_SIZE = 500
+
+# Columnas cuyo valor ya almacenado NO debe ser machacado por un NULL entrante.
+# DQ-14: Pipeline A se ejecuta con --no-crawl, asi que envia description_full=NULL.
+# Sin esta proteccion, la re-ingesta de una oferta borraria el texto que Pipeline B
+# habia conseguido por crawling. Un valor entrante NO nulo si sustituye al anterior.
+PRESERVE_ON_NULL = ("description_full",)
 
 
 def _get_connection() -> psycopg2.extensions.connection:
@@ -85,7 +92,13 @@ def _upsert_jobs(cur, jobs_df: pd.DataFrame) -> int:
     ]
     cols = [c for c in cols if c in jobs_df.columns]
     rows = _df_to_rows(jobs_df, cols)
-    update_set = ", ".join(f"{col} = EXCLUDED.{col}" for col in cols if col != "id")
+    update_set = ", ".join(
+        f"{col} = COALESCE(EXCLUDED.{col}, jobs.{col})"
+        if col in PRESERVE_ON_NULL
+        else f"{col} = EXCLUDED.{col}"
+        for col in cols
+        if col != "id"
+    )
     psycopg2.extras.execute_values(
         cur,
         f"""
