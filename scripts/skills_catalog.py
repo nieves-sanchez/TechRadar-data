@@ -188,7 +188,12 @@ SKILLS: list[tuple[str, str, list[str]]] = [
     ("Cypress",        "tool", [r"\bcypress\b"]),
     ("pytest",         "tool", [r"\bpytest\b"]),
     ("JUnit",          "tool", [r"\bjunit\b"]),
-    ("Jest",           "tool", [r"\bjest\b"]),
+    # DQ-15: patrón SENSIBLE A MAYÚSCULAS mediante el flag inline con ámbito (?-i:...).
+    # "jest" en minúscula es el verbo "ser/estar" en polaco, una de las palabras más
+    # frecuentes del idioma: con r"\bjest\b" se detectaba en el 31% de las ofertas de PL.
+    # La tecnología se escribe "Jest" o "JEST". El re.IGNORECASE con el que se compila
+    # el catálogo no afecta al interior del grupo (?-i:...). Requiere Python >= 3.11.
+    ("Jest",           "tool", [r"(?-i:\bJest\b|\bJEST\b)", r"\bjest\.?js\b"]),
     ("Postman",        "tool", [r"\bpostman\b"]),
 
     # -------------------------------------------------------------------------
