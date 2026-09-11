@@ -17,6 +17,12 @@ Uso:
     python -m scripts.repair_crawl --limit 2000        # máximo N ofertas
     python -m scripts.repair_crawl --country pl --limit 1000
     python -m scripts.repair_crawl --since-days 2 --limit 3000  # solo inflow reciente
+    python -m scripts.repair_crawl --enrich             # además, enriquecimiento
+                                                          # determinista de FASE B
+                                                          # (skills/remote/role_category)
+                                                          # sobre lo que se acaba de
+                                                          # crawlear. Desactivado por
+                                                          # defecto — opt-in explícito.
 """
 
 import argparse
@@ -27,6 +33,7 @@ import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 
+from scripts.enrich import enrich_jobs
 from scripts.extract import (
     CRAWL_BROWSER_HEADERS,
     CRAWL_CIRCUIT_BREAKER_THRESHOLD,
@@ -48,6 +55,18 @@ load_dotenv()
 # Un valor bajo minimiza la pérdida de datos si el script se interrumpe.
 # Un valor alto reduce el número de round-trips a la BD.
 UPDATE_BATCH_SIZE = 100
+
+# Intentos de enrich_jobs() por batch antes de diferirlo al reintento final de la ejecución
+# (1 intento inicial + 1 reintento inmediato). Ver notes/PROJECT_MASTER_CONTEXT.md §57.6.11
+# (Paso 4, revisión de fiabilidad 2026-09-11): sin esto, un fallo transitorio de enrich_jobs()
+# dejaría permanentemente sin enriquecer ofertas cuya description_full ya se persistió —
+# _fetch_pending() ya no las vuelve a seleccionar porque description_full deja de ser NULL.
+ENRICH_MAX_ATTEMPTS = 2
+
+# Errores de conexión (no de lógica SQL): tras uno de estos, la conexión puede no ser segura
+# de reutilizar ni siquiera para hacer rollback() — hay que reconectar, no reintentar sobre
+# la misma conexión.
+_CONNECTION_LOST_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
 
 
 # =============================================================================
@@ -148,6 +167,203 @@ def _flush_updates(conn, updates: list[tuple[int, str]]) -> None:
     conn.commit()
 
 
+def _reconnect(old_conn):
+    """
+    Cierra una conexión rota de forma segura y abre una nueva.
+
+    Tanto el rollback como el close se protegen individualmente: una conexión ya rota puede
+    volver a lanzar al intentar cualquier operación sobre ella, y eso no debe impedir abrir la
+    conexión nueva. Mismo patrón ya usado en `retro_classify.py::_reconnect_supabase` — no se
+    importa directamente desde ahí para no acoplar FASE B al módulo de Ollama (ver
+    notes/PROJECT_MASTER_CONTEXT.md Parte 8 §60.5); se reimplementa aquí porque son 6 líneas y
+    la alternativa (import cruzado entre repair_crawl.py y retro_classify.py) es peor.
+    """
+    try:
+        old_conn.rollback()
+    except Exception:
+        pass
+    try:
+        old_conn.close()
+    except Exception:
+        pass
+    logger.info("Reconectando a la BD tras pérdida de conexión durante el enriquecimiento...")
+    new_conn = _get_connection()
+    logger.info("Reconexión establecida.")
+    return new_conn
+
+
+def _attempt_enrich(conn, job_ids: list[int]):
+    """
+    Un único intento de enrich_jobs(conn, job_ids), clasificando el resultado.
+
+    `enrich_jobs()` no hace rollback propio (contrato transaccional cerrado en
+    §57.6.11/§57.6.14): ante una excepción de lógica/SQL recuperable, este intento hace el
+    `conn.rollback()` por su cuenta, protegido — si el propio rollback también falla, es señal
+    de que la conexión está realmente rota, no de un error recuperable, y se reclasifica como tal.
+
+    Returns:
+        ("ok", stats): éxito, `stats` es el dict de enrich_jobs().
+        ("connection_lost", None): error de conexión (o rollback fallido) — `conn` ya no debe
+            reutilizarse ni para un rollback; hace falta `_reconnect()`.
+        ("failed", None): error recuperable, ya con `conn.rollback()` aplicado con éxito —
+            `conn` sigue siendo utilizable para un reintento.
+    """
+    try:
+        return "ok", enrich_jobs(conn, job_ids)
+    except _CONNECTION_LOST_ERRORS:
+        logger.error(
+            "enrich_jobs() perdió la conexión a la BD (job_ids=%s).", job_ids, exc_info=True
+        )
+        return "connection_lost", None
+    except Exception:
+        logger.error(
+            "enrich_jobs() falló sobre %d ofertas (job_ids=%s).",
+            len(job_ids), job_ids, exc_info=True,
+        )
+        try:
+            conn.rollback()
+        except _CONNECTION_LOST_ERRORS:
+            logger.error("conn.rollback() también perdió la conexión.", exc_info=True)
+            return "connection_lost", None
+        except Exception:
+            logger.error(
+                "conn.rollback() falló de forma inesperada; se trata como conexión perdida.",
+                exc_info=True,
+            )
+            return "connection_lost", None
+        return "failed", None
+
+
+def _record_enrich_success(stats: dict, enrich_totals: dict) -> None:
+    for key, value in stats.items():
+        enrich_totals[key] += value
+    logger.info(
+        "  Enriquecidas %d ofertas: skills_links_attempted=%d remote_updated=%d "
+        "role_category_updated=%d",
+        stats["jobs_seen"], stats["skills_links_attempted"],
+        stats["remote_updated"], stats["role_category_updated"],
+    )
+
+
+def _flush_and_enrich(
+    conn,
+    updates: list[tuple[int, str]],
+    enrich: bool,
+    enrich_totals: dict,
+    failed_enrich_ids: list,
+):
+    """
+    Persiste un batch de description_full y, si --enrich está activo, enriquece
+    inmediatamente después esas mismas ofertas (FASE B — Paso 4, ver
+    notes/PROJECT_MASTER_CONTEXT.md §57.6.11 y Parte 8).
+
+    `enrich_jobs()` solo se llama con los job_id que ACABAN de persistirse con éxito en este
+    batch — nunca sobre ofertas fallidas/no crawleadas, y nunca sobre toda la BD. Si
+    `_flush_updates()` lanza, esta función no llega a llamar a `enrich_jobs()` (el
+    enriquecimiento solo procede tras un flush correcto).
+
+    Reintenta hasta `ENRICH_MAX_ATTEMPTS` veces (revisión de fiabilidad 2026-09-11): como
+    `_fetch_pending()` selecciona por `description_full IS NULL`, una oferta cuyo
+    description_full ya se persistió NUNCA vuelve a ser candidata en una ejecución futura —
+    perder su enriquecimiento en silencio recrearía el desfase de DQ-06. Si se agotan los
+    intentos, el batch se añade a `failed_enrich_ids` para el reintento final consolidado de
+    `run_repair()` — no se pierde en silencio, pero tampoco hay garantía absoluta sin tracking
+    persistente entre ejecuciones (ver limitación documentada en `run_repair()`).
+
+    Ante un error de conexión, reconecta (`_reconnect()`) antes de reintentar; ante un error
+    recuperable, reintenta sobre la misma conexión tras su rollback. En ningún caso una
+    excepción de `enrich_jobs()` o de su rollback se propaga fuera de esta función: el crawling
+    y los flushes posteriores de repair_crawl continúan con normalidad, igual que si --enrich no
+    se hubiera pasado.
+
+    Args:
+        conn: Conexión psycopg2 activa.
+        updates: Lista de (job_id, description_full) de este batch. Si está vacía, no hace nada.
+        enrich: Si False, se comporta exactamente igual que antes del Paso 4.
+        enrich_totals: dict mutable donde se acumulan los contadores de enrich_jobs() de toda
+            la ejecución.
+        failed_enrich_ids: lista mutable donde se acumulan los job_id cuyo enriquecimiento no
+            se consiguió tras agotar los reintentos de este batch.
+
+    Returns:
+        La conexión activa a partir de ahora (la misma `conn` recibida, o una nueva si hubo
+        que reconectar). El caller debe seguir usando el valor devuelto, no el original.
+    """
+    if not updates:
+        return conn
+
+    _flush_updates(conn, updates)
+
+    if not enrich:
+        return conn
+
+    job_ids = [job_id for job_id, _ in updates]
+    stats = None
+
+    for _ in range(ENRICH_MAX_ATTEMPTS):
+        outcome, result = _attempt_enrich(conn, job_ids)
+        if outcome == "ok":
+            stats = result
+            break
+        if outcome == "connection_lost":
+            try:
+                conn = _reconnect(conn)
+            except Exception:
+                logger.error(
+                    "No se pudo reconectar tras perder la conexión durante enrich_jobs() "
+                    "(job_ids=%s). Se abandona el reintento de este batch.",
+                    job_ids, exc_info=True,
+                )
+                break
+        # "failed": conn sigue siendo válida (rollback ya aplicado) — se reintenta con ella.
+
+    if stats is None:
+        logger.warning(
+            "  %d ofertas quedan pendientes de enriquecimiento tras %d intento(s) "
+            "(job_ids=%s); se reintentará una última vez al final de la ejecución.",
+            len(job_ids), ENRICH_MAX_ATTEMPTS, job_ids,
+        )
+        failed_enrich_ids.extend(job_ids)
+        return conn
+
+    _record_enrich_success(stats, enrich_totals)
+    return conn
+
+
+def _retry_failed_enrichment(conn, job_ids: list, enrich_totals: dict):
+    """
+    Último intento, consolidado, sobre los job_id que agotaron sus reintentos durante los
+    batches de la ejecución (ver `_flush_and_enrich`). Se ejecuta una sola vez, al final de
+    `run_repair()`.
+
+    Returns:
+        (conn, still_failed): `conn` es la conexión utilizable resultante (puede ser nueva si
+        hubo reconexión). `still_failed` es la lista de job_id que siguen sin enriquecerse tras
+        este último intento — vacía si tuvo éxito.
+    """
+    outcome, result = _attempt_enrich(conn, job_ids)
+
+    if outcome == "connection_lost":
+        try:
+            conn = _reconnect(conn)
+        except Exception:
+            logger.error(
+                "Reconexión fallida en el reintento final de enriquecimiento.", exc_info=True
+            )
+            return conn, list(job_ids)
+        outcome, result = _attempt_enrich(conn, job_ids)
+
+    if outcome != "ok":
+        return conn, list(job_ids)
+
+    _record_enrich_success(result, enrich_totals)
+    logger.info(
+        "  Reintento final de enriquecimiento recuperó %d ofertas (job_ids=%s).",
+        result["jobs_seen"], job_ids,
+    )
+    return conn, []
+
+
 # =============================================================================
 # Crawling y lógica principal
 # =============================================================================
@@ -158,6 +374,7 @@ def run_repair(
     limit: int = None,
     crawl_delay: float = CRAWL_DELAY_SECONDS,
     since_days: int = None,
+    enrich: bool = False,
 ) -> None:
     """
     Recupera las ofertas pendientes de crawling y actualiza description_full en la BD.
@@ -172,6 +389,15 @@ def run_repair(
         crawl_delay (float): Segundos de pausa entre peticiones. Por defecto 2.0.
         since_days (int | None): Si se indica, solo ofertas con posted_at en los
             últimos N días (ver _fetch_pending). None = sin filtro temporal.
+        enrich (bool): Si True, tras cada flush exitoso de description_full llama a
+            `enrich_jobs()` (FASE B — Paso 4) con los job_id recién persistidos, para
+            recalcular skills/remote/role_category de forma determinista. Desactivado
+            por defecto: si es False, el comportamiento es idéntico al de antes del
+            Paso 4. Reintenta hasta ENRICH_MAX_ATTEMPTS veces por batch, reconectando si
+            la conexión se pierde, y hace un último intento consolidado al final de la
+            ejecución sobre lo que siga fallando — ver `_flush_and_enrich()` y
+            `_retry_failed_enrichment()` para el detalle, y notes/PROJECT_MASTER_CONTEXT.md
+            §57.6.11 para la limitación conocida (sin tracking persistente entre ejecuciones).
     """
     conn = _get_connection()
 
@@ -195,6 +421,15 @@ def run_repair(
     success_count = 0
     consecutive_throttled = 0
     pending_updates: list[tuple[int, str]] = []
+    enrich_totals = {
+        "jobs_seen": 0,
+        "skills_links_attempted": 0,
+        "remote_updated": 0,
+        "role_category_updated": 0,
+    }
+    # job_id cuyo enrich_jobs() agotó sus reintentos dentro de un batch (ver
+    # _flush_and_enrich); se reintentan una última vez, todos juntos, al final de la ejecución.
+    failed_enrich_ids: list[int] = []
 
     with requests.Session() as session:
         session.headers.update(CRAWL_BROWSER_HEADERS)
@@ -227,7 +462,9 @@ def run_repair(
 
                     # Flush periódico para no perder trabajo si el script se interrumpe
                     if len(pending_updates) >= UPDATE_BATCH_SIZE:
-                        _flush_updates(conn, pending_updates)
+                        conn = _flush_and_enrich(
+                            conn, pending_updates, enrich, enrich_totals, failed_enrich_ids
+                        )
                         logger.info(
                             "  %d actualizaciones persistidas en BD.", len(pending_updates)
                         )
@@ -242,16 +479,52 @@ def run_repair(
 
     # Flush final con lo que quede en el buffer
     if pending_updates:
-        _flush_updates(conn, pending_updates)
+        conn = _flush_and_enrich(
+            conn, pending_updates, enrich, enrich_totals, failed_enrich_ids
+        )
         logger.info("  %d actualizaciones finales persistidas en BD.", len(pending_updates))
 
-    conn.close()
+    # Reintento final consolidado: ofertas cuyo description_full ya se persistió pero cuyo
+    # enrich_jobs() agotó los reintentos de su propio batch. Ver _retry_failed_enrichment().
+    if enrich and failed_enrich_ids:
+        logger.warning(
+            "Reintentando enriquecimiento diferido para %d ofertas (job_ids=%s).",
+            len(failed_enrich_ids), failed_enrich_ids,
+        )
+        conn, still_failed = _retry_failed_enrichment(conn, failed_enrich_ids, enrich_totals)
+        if still_failed:
+            logger.error(
+                "ATENCIÓN: %d ofertas con description_full ya persistida NO se pudieron "
+                "enriquecer tras reintentos: job_ids=%s. No existe tracking persistente entre "
+                "ejecuciones para reintentar estos IDs automáticamente — requieren un futuro "
+                "backfill (Paso 7 de FASE B, diferido, ver notes/PROJECT_MASTER_CONTEXT.md "
+                "Parte 8 §60.3) o volver a ejecutar repair_crawl --enrich cuando la causa del "
+                "fallo se haya resuelto.",
+                len(still_failed), still_failed,
+            )
+
+    try:
+        conn.close()
+    except Exception:
+        logger.warning(
+            "conn.close() falló al finalizar (la conexión ya podría estar rota); se ignora.",
+            exc_info=True,
+        )
 
     success_rate = (success_count / total * 100) if total else 0
     logger.info(
         "Repair crawl completado: %d/%d ofertas actualizadas (%.1f%%)",
         success_count, total, success_rate,
     )
+    if enrich:
+        logger.info(
+            "Enriquecimiento (--enrich) acumulado: jobs_seen=%d skills_links_attempted=%d "
+            "remote_updated=%d role_category_updated=%d",
+            enrich_totals["jobs_seen"],
+            enrich_totals["skills_links_attempted"],
+            enrich_totals["remote_updated"],
+            enrich_totals["role_category_updated"],
+        )
 
 
 # =============================================================================
@@ -293,6 +566,15 @@ if __name__ == "__main__":
             "Por defecto sin filtro temporal."
         ),
     )
+    parser.add_argument(
+        "--enrich",
+        action="store_true",
+        help=(
+            "Tras persistir cada batch de description_full, aplica el enriquecimiento "
+            "determinista de FASE B (enrich_jobs: skills/remote/role_category) sobre "
+            "esas mismas ofertas. Desactivado por defecto."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -301,4 +583,5 @@ if __name__ == "__main__":
         limit=args.limit,
         crawl_delay=args.delay,
         since_days=args.since_days,
+        enrich=args.enrich,
     )
