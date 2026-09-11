@@ -686,3 +686,230 @@ def test_cli_job_ids_se_combina_con_enrich():
     args = repair_crawl._build_arg_parser().parse_args(["--job-ids", "1", "2", "--enrich"])
     assert args.job_ids == [1, 2]
     assert args.enrich is True
+
+
+# =============================================================================
+# G — _flush_with_retry(): reconexión ante caída de conexión durante el flush
+# (revisión de fiabilidad 2026-09-11, tras el OperationalError real del segundo piloto del
+# Paso 5B — ver notes/PROJECT_MASTER_CONTEXT.md §57.6.11). Cierra la asimetría: enrich_jobs()
+# ya reintentaba/reconectaba desde el Paso 4, pero _flush_updates() no tenía ninguna
+# recuperación. Mismo mecanismo _reconnect() reutilizado, no una segunda implementación.
+# =============================================================================
+
+
+def test_flush_normal_no_reconecta_y_enrich_se_ejecuta_despues(monkeypatch):
+    pending = [(1, "u1")]
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        enrich_return=_stats(jobs_seen=1),
+    )
+
+    repair_crawl.run_repair(enrich=True)
+
+    assert fakes["get_connection"].call_count == 1  # sin reconexión
+    fakes["flush_updates"].assert_called_once()
+    fakes["enrich_jobs"].assert_called_once()
+
+
+def test_operationalerror_durante_flush_reconecta_y_reintenta_el_mismo_batch(monkeypatch):
+    pending = [(1, "u1"), (2, "u2")]
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending,
+        crawl_side_effect=[("t1", False), ("t2", False)],
+        enrich_return=_stats(jobs_seen=2, skills=3),
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.OperationalError("server closed the connection unexpectedly"),
+        None,
+    ]
+
+    repair_crawl.run_repair(enrich=True)  # no debe lanzar: se recupera sola
+
+    assert fakes["flush_updates"].call_count == 2
+    primer_intento = fakes["flush_updates"].call_args_list[0].args
+    segundo_intento = fakes["flush_updates"].call_args_list[1].args
+    assert primer_intento[0] is conn_vieja
+    assert segundo_intento[0] is conn_nueva
+    assert primer_intento[1] == segundo_intento[1] == [(1, "t1"), (2, "t2")]  # MISMO batch
+    fakes["enrich_jobs"].assert_called_once()
+    assert fakes["enrich_jobs"].call_args.args[0] is conn_nueva
+
+
+def test_interfaceerror_durante_flush_mismo_comportamiento_recuperable(monkeypatch):
+    pending = [(1, "u1")]
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.InterfaceError("connection already closed"),
+        None,
+    ]
+
+    repair_crawl.run_repair(enrich=False)  # no debe lanzar
+
+    assert fakes["flush_updates"].call_count == 2
+    assert fakes["get_connection"].call_count == 2
+
+
+def test_flush_rollback_fallido_no_bloquea_la_reconexion(monkeypatch):
+    """El incidente real demostró que la conexión puede estar realmente muerta: el propio
+    conn.rollback() (intentado dentro de _reconnect, best-effort) también puede fallar, y eso
+    no debe impedir seguir adelante con la reconexión."""
+    pending = [(1, "u1")]
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_vieja.rollback.side_effect = psycopg2.InterfaceError("connection already closed")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.OperationalError("server closed the connection unexpectedly"),
+        None,
+    ]
+
+    repair_crawl.run_repair(enrich=False)  # no debe lanzar
+
+    assert conn_vieja.rollback.called  # _reconnect() lo intenta, best-effort
+    assert fakes["get_connection"].call_count == 2  # la reconexión prosiguió igualmente
+    assert fakes["flush_updates"].call_count == 2
+
+
+def test_flush_reconexion_fallida_error_visible_sin_enrich(monkeypatch):
+    pending = [(1, "u1")]
+    conn_inicial = MagicMock(name="conn_inicial")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        get_connection_side_effect=[
+            conn_inicial,
+            psycopg2.OperationalError("no se pudo reconectar"),
+        ],
+    )
+    fakes["flush_updates"].side_effect = psycopg2.OperationalError(
+        "server closed the connection unexpectedly"
+    )
+
+    with pytest.raises(psycopg2.OperationalError):
+        repair_crawl.run_repair(enrich=True)
+
+    fakes["enrich_jobs"].assert_not_called()
+
+
+def test_flush_agota_los_retries_falla_de_forma_observable_sin_enrich(monkeypatch):
+    pending = [(1, "u1")]
+    conn1 = MagicMock(name="conn1")
+    conn2 = MagicMock(name="conn2")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        get_connection_side_effect=[conn1, conn2],
+    )
+    fakes["flush_updates"].side_effect = psycopg2.OperationalError(
+        "server closed the connection unexpectedly"
+    )
+
+    with pytest.raises(psycopg2.OperationalError):
+        repair_crawl.run_repair(enrich=True)  # se agotan los 2 intentos (ENRICH_MAX_ATTEMPTS)
+
+    assert fakes["flush_updates"].call_count == 2
+    fakes["enrich_jobs"].assert_not_called()
+
+
+def test_flush_error_sql_no_recuperable_no_se_reintenta_y_propaga(monkeypatch):
+    """Un error que NO es de conexión (bug de lógica/SQL) nunca debe tratarse como
+    reintentable: reconectar no lo arregla, y esconderlo detrás de un retry sería peor."""
+    pending = [(1, "u1")]
+    fakes = _install_fakes(monkeypatch, pending, crawl_side_effect=[("t1", False)])
+    fakes["flush_updates"].side_effect = psycopg2.ProgrammingError("syntax error at or near")
+
+    with pytest.raises(psycopg2.ProgrammingError):
+        repair_crawl.run_repair(enrich=True)
+
+    fakes["flush_updates"].assert_called_once()  # NUNCA se reintenta un error no de conexión
+    fakes["enrich_jobs"].assert_not_called()
+    fakes["conn"].rollback.assert_called_once()  # rollback defensivo, best-effort
+
+
+def test_conexion_nueva_tras_reconectar_se_usa_en_batches_posteriores(monkeypatch):
+    pending = [(1, "u1"), (2, "u2")]
+    monkeypatch.setattr(repair_crawl, "UPDATE_BATCH_SIZE", 1)  # fuerza dos puntos de flush
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False), ("t2", False)],
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.OperationalError("server closed the connection unexpectedly"),  # batch1 #1
+        None,  # batch1 #2, tras reconectar
+        None,  # batch2 — debe usar conn_nueva directamente
+    ]
+
+    repair_crawl.run_repair(enrich=False)
+
+    assert fakes["flush_updates"].call_count == 3
+    conn_batch2 = fakes["flush_updates"].call_args_list[2].args[0]
+    assert conn_batch2 is conn_nueva
+    assert fakes["get_connection"].call_count == 2  # no una reconexión de más
+
+
+def test_retry_de_flush_no_duplica_metricas_de_enrich(monkeypatch, caplog):
+    pending = [(1, "u1")]
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        enrich_return=_stats(jobs_seen=1, skills=3, remote=1, role=1),
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.OperationalError("server closed the connection unexpectedly"),
+        None,
+    ]
+
+    with caplog.at_level("INFO"):
+        repair_crawl.run_repair(enrich=True)
+
+    fakes["enrich_jobs"].assert_called_once()  # el retry de FLUSH no duplica la llamada a enrich
+    assert (
+        "jobs_seen=1 skills_links_attempted=3 remote_updated=1 role_category_updated=1"
+        in caplog.text
+    )
+
+
+def test_regresion_incidente_segundo_piloto_paso5b_reconexion_en_flush_final(monkeypatch, caplog):
+    """Reproduce el flujo del incidente real (2026-09-11, segundo piloto del Paso 5B, ver
+    notes/PROJECT_MASTER_CONTEXT.md §57.6.11): varios jobs crawleados con éxito,
+    psycopg2.OperationalError en el flush FINAL (tras terminar todo el crawling), reconexión,
+    segundo intento exitoso, y el enriquecimiento procede con normalidad — sin crash no
+    gestionado. Protege el FLUJO completo (crawl → flush final → enrich), no una función
+    aislada."""
+    pending = [(1, "u1"), (2, "u2"), (3, "u3")]
+    conn_vieja = MagicMock(name="conn_vieja")
+    conn_nueva = MagicMock(name="conn_nueva")
+    fakes = _install_fakes(
+        monkeypatch, pending,
+        crawl_side_effect=[("t1", False), ("t2", False), ("t3", False)],
+        enrich_return=_stats(jobs_seen=3, skills=5),
+        get_connection_side_effect=[conn_vieja, conn_nueva],
+    )
+    fakes["flush_updates"].side_effect = [
+        psycopg2.OperationalError("server closed the connection unexpectedly"),
+        None,
+    ]
+
+    with caplog.at_level("INFO"):
+        repair_crawl.run_repair(enrich=True)  # no debe lanzar: se recupera sola
+
+    assert fakes["flush_updates"].call_count == 2
+    lote_esperado = [(1, "t1"), (2, "t2"), (3, "t3")]
+    assert fakes["flush_updates"].call_args_list[0].args[1] == lote_esperado
+    assert fakes["flush_updates"].call_args_list[1].args[1] == lote_esperado
+    fakes["enrich_jobs"].assert_called_once()
+    assert fakes["enrich_jobs"].call_args.args[0] is conn_nueva
+    assert "Reconectando a la BD" in caplog.text

@@ -188,6 +188,53 @@ def _flush_updates(conn, updates: list[tuple[int, str]]) -> None:
     conn.commit()
 
 
+def _attempt_flush(conn, updates: list[tuple[int, str]]):
+    """
+    Un único intento de `_flush_updates(conn, updates)`, clasificando el resultado.
+
+    Cierra la asimetría descubierta en el segundo piloto real del Paso 5B (2026-09-11,
+    ver notes/PROJECT_MASTER_CONTEXT.md §57.6.11): `enrich_jobs()` reintenta y reconecta
+    desde el Paso 4, pero `_flush_updates()` no tenía ninguna recuperación ante una caída de
+    conexión — un `psycopg2.OperationalError` ahí crasheaba todo `repair_crawl.py` sin haber
+    llegado siquiera a intentar el enriquecimiento.
+
+    Reutiliza exactamente el mismo criterio de clasificación que `_attempt_enrich()`: error de
+    conexión → reintentable (tras reconectar); cualquier otro error → NO reintentable, con un
+    rollback defensivo antes de dejarlo propagar (un error de lógica/SQL no se arregla
+    reconectando, y no debe esconderse detrás de un reintento).
+
+    Returns:
+        ("ok", None): éxito, `_flush_updates()` ya hizo su `conn.commit()`.
+        ("connection_lost", exc): error de conexión — `exc` es la excepción original, para
+            poder propagarla si se agotan los reintentos de `_flush_with_retry()`.
+
+    Raises:
+        Cualquier excepción que NO sea de conexión (`psycopg2.OperationalError`/
+        `InterfaceError`) — nunca se convierte en un resultado del tuple; el caller no debe
+        reintentarla.
+    """
+    try:
+        _flush_updates(conn, updates)
+        return "ok", None
+    except _CONNECTION_LOST_ERRORS as exc:
+        logger.error(
+            "_flush_updates() perdió la conexión a la BD (job_ids=%s).",
+            [job_id for job_id, _ in updates], exc_info=True,
+        )
+        return "connection_lost", exc
+    except Exception:
+        logger.error(
+            "_flush_updates() falló sobre %d ofertas (job_ids=%s) por un error no relacionado "
+            "con la conexión — no se reintenta.",
+            len(updates), [job_id for job_id, _ in updates], exc_info=True,
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def _reconnect(old_conn):
     """
     Cierra una conexión rota de forma segura y abre una nueva.
@@ -207,10 +254,65 @@ def _reconnect(old_conn):
         old_conn.close()
     except Exception:
         pass
-    logger.info("Reconectando a la BD tras pérdida de conexión durante el enriquecimiento...")
+    logger.info("Reconectando a la BD tras pérdida de conexión...")
     new_conn = _get_connection()
     logger.info("Reconexión establecida.")
     return new_conn
+
+
+def _flush_with_retry(conn, updates: list[tuple[int, str]]):
+    """
+    Persiste `updates` con reintento ante pérdida de conexión, reutilizando `_reconnect()`
+    (el mismo mecanismo ya usado para `enrich_jobs()` desde el Paso 4 — no hay una segunda
+    implementación de reconexión en este archivo).
+
+    Reintenta hasta `ENRICH_MAX_ATTEMPTS` veces (mismo criterio que enrichment — no hay motivo
+    para que el máximo de intentos difiera entre ambas escrituras).
+
+    Idempotencia del reintento — verificado leyendo el SQL real de `_flush_updates()`: el
+    `UPDATE ... SET description_full = v.description_full ... WHERE jobs.id = v.job_id` es la
+    ÚNICA sentencia, sin ningún otro efecto (ni contador, ni INSERT, ni trigger). Reaplicar
+    exactamente el mismo `updates` sobre una conexión nueva dos veces deja el mismo estado
+    final que aplicarlo una — incluido el caso ambiguo en el que el primer intento hubiera
+    llegado a hacer `COMMIT` en el servidor sin que el cliente llegara a confirmarlo antes de
+    que la conexión se cerrara: el segundo `UPDATE` simplemente vuelve a escribir el mismo
+    `job_id -> description_full`, sin duplicar nada. Por eso reintentar el mismo batch es
+    seguro sin necesidad de comprobar el estado previo.
+
+    Si se agotan los intentos por pérdida de conexión repetida, o si `_flush_updates()` falla
+    por un motivo que NO es de conexión, la excepción se propaga (nunca se llama a
+    `enrich_jobs()` para ese batch, y la ejecución de `repair_crawl.py` falla de forma visible
+    — no hay tracking persistente entre ejecuciones que permita diferir esto en silencio, a
+    diferencia de `enrich_jobs()`). Esto conserva la semántica previa al fix (un fallo de flush
+    ya hacía fallar todo el script) — el único cambio es que ahora, ante una caída de conexión,
+    se reintenta primero.
+
+    Returns:
+        La conexión activa a partir de ahora (la misma recibida, o una nueva si hubo que
+        reconectar). El caller debe seguir usando el valor devuelto, no el original.
+
+    Raises:
+        La última excepción de conexión si se agotan los `ENRICH_MAX_ATTEMPTS` intentos, la
+        excepción de la propia reconexión si `_reconnect()` falla, o cualquier excepción no
+        relacionada con la conexión (sin reintentar, ver `_attempt_flush()`).
+    """
+    last_error = None
+    for attempt in range(ENRICH_MAX_ATTEMPTS):
+        outcome, error = _attempt_flush(conn, updates)
+        if outcome == "ok":
+            return conn
+        last_error = error
+        if attempt < ENRICH_MAX_ATTEMPTS - 1:
+            # Solo reconectar si va a haber un intento más — reconectar tras el ÚLTIMO
+            # intento fallido sería una reconexión desperdiciada, ya que a continuación se
+            # abandona de todas formas.
+            conn = _reconnect(conn)  # si esto lanza, se propaga tal cual: reconexión fallida = visible
+    logger.error(
+        "_flush_updates() agotó %d intento(s) por pérdida de conexión (job_ids=%s); la "
+        "ejecución falla — description_full de este batch NO quedó persistida.",
+        ENRICH_MAX_ATTEMPTS, [job_id for job_id, _ in updates],
+    )
+    raise last_error
 
 
 def _attempt_enrich(conn, job_ids: list[int]):
@@ -279,9 +381,10 @@ def _flush_and_enrich(
     notes/PROJECT_MASTER_CONTEXT.md §57.6.11 y Parte 8).
 
     `enrich_jobs()` solo se llama con los job_id que ACABAN de persistirse con éxito en este
-    batch — nunca sobre ofertas fallidas/no crawleadas, y nunca sobre toda la BD. Si
-    `_flush_updates()` lanza, esta función no llega a llamar a `enrich_jobs()` (el
-    enriquecimiento solo procede tras un flush correcto).
+    batch — nunca sobre ofertas fallidas/no crawleadas, y nunca sobre toda la BD. El flush usa
+    `_flush_with_retry()` (reintenta/reconecta ante caída de conexión — ver su docstring); si
+    aun así no consigue persistir, la excepción se propaga y esta función NO llega a llamar a
+    `enrich_jobs()` (el enriquecimiento solo procede tras un flush confirmado).
 
     Reintenta hasta `ENRICH_MAX_ATTEMPTS` veces (revisión de fiabilidad 2026-09-11): como
     `_fetch_pending()` selecciona por `description_full IS NULL`, una oferta cuyo
@@ -313,7 +416,7 @@ def _flush_and_enrich(
     if not updates:
         return conn
 
-    _flush_updates(conn, updates)
+    conn = _flush_with_retry(conn, updates)  # puede lanzar: ver su docstring
 
     if not enrich:
         return conn
