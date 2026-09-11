@@ -2,17 +2,24 @@
 tests/test_repair_crawl.py — Integración de repair_crawl.py con enrich_jobs() (FASE B — Paso 4,
 notes/PROJECT_MASTER_CONTEXT.md §57.6.11 y Parte 8), incluida la revisión de fiabilidad del
 2026-09-11: qué pasa cuando enrich_jobs() falla DESPUÉS de que description_full ya se persistió.
+También cubre el filtro `--job-ids` (soporte para el piloto controlado de FASE B — Paso 5).
 
 No testea la lógica de enrich_jobs() en sí — ya cubierta en tests/test_enrich.py. Aquí se testea
 el CALLER y la orquestación: que repair_crawl.py solo llama a enrich_jobs() cuando --enrich está
 activo, que lo hace exactamente con los job_id recién persistidos, que reintenta antes de dar un
-batch por perdido, que reconecta ante un error de conexión sin crashear, y que lo que sigue
-fallando tras agotar los reintentos queda registrado de forma explícita (nunca en silencio). Todo
-con dobles (mocks): ningún test se conecta a Supabase real ni crawlea de verdad.
+batch por perdido, que reconecta ante un error de conexión sin crashear, que lo que sigue
+fallando tras agotar los reintentos queda registrado de forma explícita (nunca en silencio), y
+que `--job-ids` restringe correctamente el universo de `_fetch_pending()` SIN saltarse ninguna
+de sus guardas normales. Todo con dobles (mocks) o SQLite en memoria: ningún test se conecta a
+Supabase real ni crawlea de verdad.
 """
 
-import psycopg2
+import re
+import sqlite3
 from unittest.mock import MagicMock
+
+import psycopg2
+import pytest
 
 from scripts import repair_crawl
 
@@ -445,3 +452,237 @@ def test_sin_enrich_ninguna_de_las_rutas_de_reintento_se_activa(monkeypatch):
     repair_crawl.run_repair(enrich=False)
 
     assert fakes["get_connection"].call_count == 1
+
+
+# =============================================================================
+# F — --job-ids: filtro adicional sobre _fetch_pending() (FASE B — Paso 5, preparación)
+# =============================================================================
+#
+# Los tests de esta sección se dividen en dos grupos:
+#   - Guardas reales (F1): ejecutan _fetch_pending() de verdad contra SQLite en memoria, para
+#     demostrar que --job-ids es un filtro ADICIONAL y no un atajo que se salte
+#     description_full IS NULL / is_active / url NOT LIKE '%/land/%'. Traducción de dialecto
+#     mínima (%s → ?, = ANY(%s) → IN (...)) — mismo enfoque que tests/test_enrich.py, sin
+#     reimplementar la lógica de _fetch_pending().
+#   - Orquestación (F2): con los mocks ya usados en el resto del archivo, para verificar que
+#     run_repair() transmite job_ids correctamente y loguea la observabilidad pedida.
+
+
+def _translate_pg_to_sqlite_simple(sql: str, params):
+    """
+    Traducción de dialecto mínima para _fetch_pending(): `%s` → `?`, `= ANY(%s)` → `IN (...)`
+    expandiendo la lista de ese parámetro. No traduce NOW()/make_interval() — los tests de
+    esta sección no usan --since-days a propósito, para no necesitarlo.
+    """
+    if params is None:
+        return sql.replace("%s", "?"), ()
+    params = list(params)
+    parts, out_params, idx = [], [], 0
+    for token in re.split(r"(=\s*ANY\(%s\)|%s)", sql):
+        if re.fullmatch(r"=\s*ANY\(%s\)", token):
+            seq = list(params[idx]); idx += 1
+            placeholders = ", ".join("?" for _ in seq) or "NULL"
+            parts.append(f"IN ({placeholders})")
+            out_params.extend(seq)
+        elif token == "%s":
+            parts.append("?")
+            out_params.append(params[idx]); idx += 1
+        else:
+            parts.append(token)
+    return "".join(parts), out_params
+
+
+class _SQLitePGCursor:
+    def __init__(self, sqlite_cur):
+        self._c = sqlite_cur
+
+    def execute(self, sql, params=None):
+        translated_sql, translated_params = _translate_pg_to_sqlite_simple(sql, params)
+        self._c.execute(translated_sql, translated_params)
+        return self
+
+    def fetchall(self):
+        return self._c.fetchall()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _SQLitePGConn:
+    def __init__(self, sqlite_conn):
+        self._conn = sqlite_conn
+
+    def cursor(self):
+        return _SQLitePGCursor(self._conn.cursor())
+
+
+@pytest.fixture
+def sqlite_jobs_conn():
+    """
+    Tabla `jobs` mínima en SQLite en memoria, con filas diseñadas para ejercitar cada guarda
+    de _fetch_pending() por separado:
+      1: elegible (description_full NULL, activo, /details/, país 'de')
+      2: description_full YA NO es NULL -> nunca elegible
+      3: is_active = 0 -> nunca elegible
+      4: URL /land/ -> nunca elegible
+      5: elegible pero NO se pide en ningún test de esta sección (país 'de')
+      6: elegible, país 'fr' (para el test de intersección con --country)
+    """
+    raw = sqlite3.connect(":memory:")
+    raw.execute(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY,
+            description_full TEXT,
+            url TEXT,
+            is_active INTEGER,
+            country_code TEXT,
+            posted_at TEXT
+        )
+        """
+    )
+    raw.executemany(
+        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (1, None, "https://x/details/1", 1, "de", "2026-09-01"),
+            (2, "ya tiene texto", "https://x/details/2", 1, "de", "2026-09-02"),
+            (3, None, "https://x/details/3", 0, "de", "2026-09-03"),
+            (4, None, "https://x/land/4", 1, "de", "2026-09-04"),
+            (5, None, "https://x/details/5", 1, "de", "2026-09-05"),
+            (6, None, "https://x/details/6", 1, "fr", "2026-09-06"),
+        ],
+    )
+    raw.commit()
+    yield _SQLitePGConn(raw)
+    raw.close()
+
+
+# --- F1: guardas reales, contra SQLite ---------------------------------------
+
+
+def test_job_ids_excluye_description_full_no_null(sqlite_jobs_conn):
+    assert repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[2]) == []
+
+
+def test_job_ids_excluye_inactivos(sqlite_jobs_conn):
+    assert repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[3]) == []
+
+
+def test_job_ids_excluye_urls_land(sqlite_jobs_conn):
+    assert repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[4]) == []
+
+
+def test_job_ids_no_incluye_ids_no_solicitados(sqlite_jobs_conn):
+    # id=5 es elegible pero no se pide -> no debe aparecer, aunque 1 sí.
+    result = repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[1])
+    assert [r[0] for r in result] == [1]
+
+
+def test_job_ids_limita_a_los_solicitados_manteniendo_todas_las_guardas(sqlite_jobs_conn):
+    """Un solo SELECT real pidiendo los cuatro casos de guarda a la vez (2, 3, 4 y 5 son
+    inelegibles o no solicitados por distintos motivos): solo debe sobrevivir el id=1."""
+    result = repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[1, 2, 3, 4])
+    assert result == [(1, "https://x/details/1")]
+
+
+def test_job_ids_none_no_aplica_ningun_filtro(sqlite_jobs_conn):
+    # Sin job_ids: los elegibles reales son 1, 5 y 6 (2/3/4 caen por sus propias guardas).
+    result = repair_crawl._fetch_pending(sqlite_jobs_conn)
+    assert sorted(r[0] for r in result) == [1, 5, 6]
+
+
+def test_job_ids_lista_vacia_se_trata_igual_que_none(sqlite_jobs_conn):
+    sin_filtro = sorted(r[0] for r in repair_crawl._fetch_pending(sqlite_jobs_conn))
+    con_lista_vacia = sorted(
+        r[0] for r in repair_crawl._fetch_pending(sqlite_jobs_conn, job_ids=[])
+    )
+    assert con_lista_vacia == sin_filtro  # [] no debe interpretarse como "ningún resultado"
+
+
+def test_job_ids_se_combina_por_interseccion_con_country_code(sqlite_jobs_conn):
+    # id=6 es 'fr'; pedirlo junto con country_code='de' debe excluirlo (intersección, no unión).
+    result = repair_crawl._fetch_pending(sqlite_jobs_conn, country_code="de", job_ids=[1, 6])
+    assert result == [(1, "https://x/details/1")]
+
+
+# --- F2: orquestación (mocks) -------------------------------------------------
+
+
+def test_run_repair_sin_job_ids_pasa_none_a_fetch_pending(monkeypatch):
+    pending = [(1, "u1")]
+    fakes = _install_fakes(monkeypatch, pending, crawl_side_effect=[("t1", False)])
+
+    repair_crawl.run_repair()
+
+    assert fakes["fetch_pending"].call_args.kwargs.get("job_ids") is None
+
+
+def test_run_repair_transmite_job_ids_a_fetch_pending(monkeypatch):
+    pending = [(1, "u1")]
+    fakes = _install_fakes(monkeypatch, pending, crawl_side_effect=[("t1", False)])
+
+    repair_crawl.run_repair(job_ids=[1, 999])
+
+    assert fakes["fetch_pending"].call_args.kwargs.get("job_ids") == [1, 999]
+
+
+def test_run_repair_loguea_ids_solicitados_y_elegibles(monkeypatch, caplog):
+    # 3 IDs solicitados, pero _fetch_pending() (mockeado) solo devuelve 2 — simula que uno
+    # de los 3 dejó de ser candidato entre el diseño de la muestra y la ejecución.
+    pending = [(1, "u1"), (2, "u2")]
+    _install_fakes(monkeypatch, pending, crawl_side_effect=[("t1", False), ("t2", False)])
+
+    with caplog.at_level("INFO"):
+        repair_crawl.run_repair(job_ids=[1, 2, 3])
+
+    assert "IDs solicitados: 3" in caplog.text
+    assert "pendientes elegibles: 2" in caplog.text
+
+
+def test_run_repair_sin_job_ids_no_loguea_esa_linea(monkeypatch, caplog):
+    pending = [(1, "u1")]
+    _install_fakes(monkeypatch, pending, crawl_side_effect=[("t1", False)])
+
+    with caplog.at_level("INFO"):
+        repair_crawl.run_repair()
+
+    assert "IDs solicitados" not in caplog.text
+
+
+def test_job_ids_con_enrich_coexisten_sin_alterar_la_logica_del_paso4(monkeypatch):
+    """--job-ids + --enrich a la vez: enrich_jobs() se sigue llamando exactamente igual que
+    sin --job-ids (mismo caller, mismo contrato de reintento/rollback del Paso 4 — no tocado
+    en este turno)."""
+    pending = [(1, "u1")]
+    fakes = _install_fakes(
+        monkeypatch, pending, crawl_side_effect=[("t1", False)],
+        enrich_return=_stats(jobs_seen=1, skills=2),
+    )
+
+    repair_crawl.run_repair(job_ids=[1], enrich=True)
+
+    fakes["enrich_jobs"].assert_called_once()
+    conn_arg, job_ids_arg = fakes["enrich_jobs"].call_args.args
+    assert job_ids_arg == [1]
+
+
+# --- F3: parsing CLI -----------------------------------------------------------
+
+
+def test_cli_job_ids_parsea_varios_enteros():
+    args = repair_crawl._build_arg_parser().parse_args(["--job-ids", "123", "456", "789"])
+    assert args.job_ids == [123, 456, 789]
+
+
+def test_cli_job_ids_por_defecto_none():
+    args = repair_crawl._build_arg_parser().parse_args([])
+    assert args.job_ids is None
+
+
+def test_cli_job_ids_se_combina_con_enrich():
+    args = repair_crawl._build_arg_parser().parse_args(["--job-ids", "1", "2", "--enrich"])
+    assert args.job_ids == [1, 2]
+    assert args.enrich is True

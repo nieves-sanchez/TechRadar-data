@@ -23,6 +23,12 @@ Uso:
                                                           # sobre lo que se acaba de
                                                           # crawlear. Desactivado por
                                                           # defecto — opt-in explícito.
+    python -m scripts.repair_crawl --job-ids 123 456 789 --enrich  # solo esos IDs
+                                                          # (filtro adicional, opt-in, para
+                                                          # pilotos/diagnóstico controlados —
+                                                          # ver FASE B Paso 5). No se salta
+                                                          # ninguna guarda normal de
+                                                          # _fetch_pending().
 """
 
 import argparse
@@ -79,6 +85,7 @@ def _fetch_pending(
     country_code: str = None,
     limit: int = None,
     since_days: int = None,
+    job_ids: list = None,
 ) -> list[tuple[int, str]]:
     """
     Recupera de la BD las ofertas activas con URL pero sin description_full.
@@ -102,6 +109,14 @@ def _fetch_pending(
             re-procesar la cola dura histórica: los fallos viejos quedan fuera de
             la ventana y solo se reintenta el inflow reciente. None = sin filtro
             temporal (comportamiento original).
+        job_ids (list[int] | None): Si se indica, restringe el universo a exactamente
+            esos IDs — un job solo se devuelve si además cumple TODAS las guardas
+            normales de arriba (`description_full IS NULL`, `is_active`, etc.). Es un
+            filtro ADICIONAL (`AND id = ANY(...)`), no un atajo que las salte. Se
+            combina por intersección con `country_code`/`since_days` si también se
+            pasan — mismo patrón que el resto de filtros de esta función, sin lógica
+            especial. Pensado para ejecuciones controladas/diagnósticas (FASE B —
+            Paso 5, ver notes/PROJECT_MASTER_CONTEXT.md Parte 8), no para uso normal.
 
     Returns:
         list[tuple[int, str]]: Lista de (job_id, url).
@@ -129,6 +144,12 @@ def _fetch_pending(
         # un parámetro entero, sin interpolar texto en la query.
         query += " AND posted_at >= NOW() - make_interval(days => %s)"
         params.append(since_days)
+
+    if job_ids:
+        # ANY(%s) con una lista de enteros como parámetro — psycopg2 la adapta
+        # directamente a un array de PostgreSQL, sin interpolar IDs en el SQL.
+        query += " AND id = ANY(%s)"
+        params.append(list(job_ids))
 
     query += " ORDER BY posted_at DESC"
 
@@ -375,6 +396,7 @@ def run_repair(
     crawl_delay: float = CRAWL_DELAY_SECONDS,
     since_days: int = None,
     enrich: bool = False,
+    job_ids: list = None,
 ) -> None:
     """
     Recupera las ofertas pendientes de crawling y actualiza description_full en la BD.
@@ -398,13 +420,27 @@ def run_repair(
             ejecución sobre lo que siga fallando — ver `_flush_and_enrich()` y
             `_retry_failed_enrichment()` para el detalle, y notes/PROJECT_MASTER_CONTEXT.md
             §57.6.11 para la limitación conocida (sin tracking persistente entre ejecuciones).
+        job_ids (list[int] | None): Si se indica, restringe el universo de candidatos a
+            exactamente esos IDs (filtro adicional sobre `_fetch_pending()`, no un atajo
+            que se salte sus guardas — ver su docstring). Pensado para ejecuciones
+            controladas/diagnósticas (FASE B — Paso 5). None = comportamiento normal,
+            sin filtro por ID.
     """
     conn = _get_connection()
 
     pending = _fetch_pending(
-        conn, country_code=country_code, limit=limit, since_days=since_days
+        conn, country_code=country_code, limit=limit, since_days=since_days,
+        job_ids=job_ids,
     )
     total = len(pending)
+
+    if job_ids:
+        # Observabilidad explícita: el pool es dinámico (otras ejecuciones de Pipeline B
+        # pueden rellenar description_full entre que se eligen los IDs y que se ejecuta
+        # este run), así que cuántos de los solicitados siguen siendo candidatos elegibles
+        # es información operativa relevante, no un detalle interno — sin query adicional,
+        # ambos números ya están disponibles aquí.
+        logger.info("IDs solicitados: %d | pendientes elegibles: %d", len(job_ids), total)
 
     if not pending:
         filtro = f" para país '{country_code}'" if country_code else ""
@@ -531,7 +567,13 @@ def run_repair(
 # Punto de entrada para ejecución directa: python -m scripts.repair_crawl
 # =============================================================================
 
-if __name__ == "__main__":
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Construye el parser de argumentos. Extraído a función (sin cambio de comportamiento)
+    para poder testear el parsing de `--job-ids` directamente, sin invocar el script como
+    subproceso.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Rellena description_full en ofertas activas con URL pero sin descripción completa. "
@@ -575,8 +617,26 @@ if __name__ == "__main__":
             "esas mismas ofertas. Desactivado por defecto."
         ),
     )
+    parser.add_argument(
+        "--job-ids",
+        type=int,
+        nargs="+",
+        metavar="ID",
+        help=(
+            "Restringe el universo de candidatos a exactamente estos IDs (separados por "
+            "espacio). Filtro ADICIONAL: un job solo se procesa si además sigue cumpliendo "
+            "todas las guardas normales (description_full IS NULL, is_active, etc. — no se "
+            "salta ninguna). Se combina con --country/--since-days si se pasan también. "
+            "Pensado para ejecuciones controladas/diagnósticas (FASE B — Paso 5), no para "
+            "uso normal. Por defecto, sin filtro por ID."
+        ),
+    )
 
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = _build_arg_parser().parse_args()
 
     run_repair(
         country_code=args.country,
@@ -584,4 +644,5 @@ if __name__ == "__main__":
         crawl_delay=args.delay,
         since_days=args.since_days,
         enrich=args.enrich,
+        job_ids=args.job_ids,
     )
