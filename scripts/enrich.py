@@ -1,29 +1,31 @@
 """
 enrich.py — Enriquecimiento determinista de ofertas tras la llegada de description_full.
 
-FASE B (Paso 2 de §57.6.11 en notes/PROJECT_MASTER_CONTEXT.md): cuando Pipeline B consigue
+FASE B (Pasos 2 y 3 de §57.6.11 en notes/PROJECT_MASTER_CONTEXT.md): cuando Pipeline B consigue
 description_full para una oferta, este módulo calcula qué cambios de skills, remote y
-role_category corresponderían aplicar, siguiendo las reglas conservadoras ya cerradas en
-§57.6.4-§57.6.6. Reutiliza las funciones deterministas de transform.py (title/description →
-skills/remote/role_category); no reimplementa ninguna lógica de extracción ni clasificación,
-y no depende de Ollama en ningún punto.
+role_category corresponden y los persiste, siguiendo las reglas conservadoras ya cerradas en
+§57.6.4-§57.6.6. Reutiliza las funciones deterministas de transform.py y la persistencia de
+skills de load.py; no reimplementa ninguna lógica de extracción, clasificación ni upsert, y no
+depende de Ollama ni hace HTTP en ningún punto.
 
-Este módulo (Paso 2) es SOLO la capa de CÁLCULO PURO: no lee ni escribe en Supabase.
-La capa de persistencia (SELECT de candidatos, UPSERT de skills, UPDATE de remote/role_category)
-es el Paso 3, todavía no implementado.
+Dos capas:
+  - CÁLCULO PURO (Paso 2): compute_*() — no leen ni escriben en BD, no dependen de nada externo.
+  - PERSISTENCIA (Paso 3): enrich_jobs(conn, job_ids) — lee de `jobs`, aplica las decisiones y
+    persiste en `job_skills` / `jobs.remote` / `jobs.role_category`. Nada más.
 
 Reglas cerradas que este módulo hace cumplir (no reabrir sin nueva evidencia — ver §57.6.14):
-    - Skills:        siempre aditivas. Este módulo solo DETECTA; nunca decide qué borrar.
-    - remote:        se propone un nuevo valor solo si el actual es NULL.
-    - role_category: se propone una nueva categoría solo si la actual es exactamente 'other'.
+    - Skills:        siempre aditivas. Se DETECTAN y se AÑADEN; nunca se borra un vínculo.
+    - remote:        se actualiza solo si el actual es NULL.
+    - role_category: se actualiza solo si el actual es exactamente 'other'.
                       NULL nunca se toca (protege el marcado de revisión manual de Pipeline C).
 
 Uso:
-    from scripts.enrich import compute_enrichment
+    from scripts.enrich import enrich_jobs, compute_enrichment
 """
 
 from typing import Optional
 
+from scripts.load import upsert_skills_and_links
 from scripts.skills_catalog import ROLE_KEYWORDS
 from scripts.transform import (
     _classify_role,
@@ -159,3 +161,132 @@ def compute_enrichment(job: dict) -> dict:
             job.get("role_category"), title, description_full
         ),
     }
+
+
+# =============================================================================
+# Capa de persistencia (Paso 3 de §57.6.11)
+# =============================================================================
+
+# Columnas de `jobs` que enrich_jobs() LEE. Solo `remote` y `role_category` pueden
+# además escribirse (con guardas). Ninguna otra columna se toca (§57.6.7).
+_READ_COLUMNS = ("id", "title", "description_full", "location_display", "remote", "role_category")
+
+
+def enrich_jobs(conn, job_ids) -> dict:
+    """
+    Aplica el enriquecimiento determinista de FASE B a un conjunto de ofertas ya identificadas.
+
+    Consumidores previstos, ambos reutilizando ESTA misma función pública sin duplicar reglas
+    (ninguno existe todavía; este Paso 3 solo entrega la API compartida — ver §57.6.2/3):
+      - Flujo continuo: `repair_crawl.py` tras cada flush de `description_full` (Paso 4).
+      - Backfill histórico: `backfill_enrich.py` por lotes (Paso 7).
+
+    Por cada oferta:
+      1. Lee title, description_full, location_display, remote, role_category.
+      2. Si `description_full` no es utilizable (tras `_clean_description_text()` queda vacío) la
+         salta: no hay texto nuevo que aprovechar y Pipeline A ya procesó el título en la ingesta.
+      3. Calcula las decisiones con `compute_enrichment()` (capa pura del Paso 2).
+      4. Persiste:
+         - skills: SIEMPRE aditivo, vía `upsert_skills_and_links()` de `load.py`
+           (`ON CONFLICT DO NOTHING` en skills y job_skills → sin duplicados, sin borrar nada).
+         - remote: `UPDATE ... WHERE id = %s AND remote IS NULL` — la guarda en el propio SQL
+           protege el contrato incluso ante un cambio concurrente entre la lectura y la escritura.
+         - role_category: `UPDATE ... WHERE id = %s AND role_category = 'other'` — misma guarda.
+      5. Ninguna otra columna se toca.
+
+    Semántica transaccional (detalle de implementación resuelto en §57.6.11, coherente con el
+    repositorio): toda la llamada es UNA transacción. `conn.commit()` se ejecuta como última
+    sentencia, y SOLO si el lote completo tuvo éxito. Esto garantiza que **no se hace ningún
+    commit parcial** — pero no más que eso:
+      - Si algo lanza, la excepción propaga y `enrich_jobs()` NO hace rollback por sí misma.
+      - Las modificaciones de la transacción fallida quedan sin commitear en la conexión.
+        **El caller es responsable de ejecutar `conn.rollback()` antes de reutilizar `conn`**
+        (mismo patrón que `repair_crawl._flush_updates` y
+        `retro_classify._process_batch_with_tracking`, que tampoco hacen rollback propio).
+      - Esto es especialmente relevante en PostgreSQL: tras ciertos errores SQL la transacción
+        queda "abortada" (`InFailedSqlTransaction`) hasta que se hace `rollback()` — cualquier
+        sentencia posterior sobre esa misma conexión fallará hasta entonces.
+      - **Requisito explícito para el Paso 4:** cuando `repair_crawl.py` llame a `enrich_jobs()`,
+        deberá capturar la excepción y ejecutar `conn.rollback()` antes de volver a usar esa
+        conexión (p. ej. antes del siguiente `_flush_updates()`). Todavía no implementado.
+
+    Idempotente: una segunda ejecución sobre los mismos IDs, tras un commit exitoso, no cambia
+    ya nada en `jobs` (las guardas de `remote`/`role_category` ya no se cumplen) ni duplica
+    vínculos en `job_skills` (`ON CONFLICT DO NOTHING`).
+
+    Args:
+        conn: Conexión psycopg2 activa. El caller es dueño de su ciclo de vida (incluido el
+              rollback ante excepción).
+        job_ids: Iterable de IDs de oferta. Vacío → no-op. IDs inexistentes → se ignoran.
+
+    Returns:
+        dict con contadores:
+          - jobs_seen: filas de `jobs` encontradas para los IDs pedidos (real, de `len(rows)`).
+          - skills_links_attempted: pares (oferta, skill) detectados y enviados a
+            `upsert_skills_and_links()`. NO es el número de filas nuevas realmente insertadas en
+            `job_skills` — `ON CONFLICT DO NOTHING` puede descartar en silencio los que ya
+            existían (p. ej. en una segunda ejecución). No hay round-trip adicional para contar
+            inserciones reales porque nada en el proyecto lo necesita todavía.
+          - remote_updated / role_category_updated: filas **realmente** actualizadas, tomado de
+            `cur.rowcount` tras el `UPDATE` con guarda — si la guarda no matchea (ya no era NULL/
+            'other'), `rowcount` es 0 y no se cuenta.
+    """
+    ids = [int(i) for i in job_ids]
+    stats = {
+        "jobs_seen": 0,
+        "skills_links_attempted": 0,
+        "remote_updated": 0,
+        "role_category_updated": 0,
+    }
+    if not ids:
+        return stats
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(_READ_COLUMNS)} FROM jobs WHERE id = ANY(%s)",
+            (ids,),
+        )
+        rows = cur.fetchall()
+        stats["jobs_seen"] = len(rows)
+
+        skill_records: list[dict] = []
+        for job_id, title, description_full, location_display, remote, role_category in rows:
+            if not _clean_description_text(description_full):
+                continue  # sin texto nuevo utilizable → nada que enriquecer
+
+            decision = compute_enrichment({
+                "title": title,
+                "description_full": description_full,
+                "location_display": location_display,
+                "remote": remote,
+                "role_category": role_category,
+            })
+
+            for skill in decision["new_skills"]:
+                skill_records.append({
+                    "job_id": job_id,
+                    "skill_name": skill["name"],
+                    "skill_category": skill["category"],
+                })
+
+            if decision["remote_update"] is not None:
+                cur.execute(
+                    "UPDATE jobs SET remote = %s WHERE id = %s AND remote IS NULL",
+                    (decision["remote_update"], job_id),
+                )
+                stats["remote_updated"] += max(cur.rowcount, 0)
+
+            if decision["role_category_update"] is not None:
+                cur.execute(
+                    "UPDATE jobs SET role_category = %s WHERE id = %s AND role_category = 'other'",
+                    (decision["role_category_update"], job_id),
+                )
+                stats["role_category_updated"] += max(cur.rowcount, 0)
+
+        # upsert_skills_and_links() devuelve len(links): los pares (job_id, skill_id) ENVIADOS
+        # a la INSERT, no los realmente insertados (ON CONFLICT DO NOTHING puede descartarlos
+        # en silencio). Por eso el contador se llama "attempted", no "added".
+        stats["skills_links_attempted"] = upsert_skills_and_links(cur, skill_records)
+
+    conn.commit()
+    return stats
