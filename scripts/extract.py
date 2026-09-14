@@ -492,6 +492,50 @@ def _crawl_justjoin(session: requests.Session, url: str) -> Optional[str]:
     return None
 
 
+# Encabezados de "cola externa" de páginas nativas Adzuna (details/) demostrados con
+# texto REAL capturado en el piloto de FASE B (2026-09-11): ofertas similares,
+# búsquedas populares y widgets de estadísticas salariales que a veces quedan pegados
+# al cuerpo real de la oferta. Ver notes/PROJECT_MASTER_CONTEXT.md §57.6.15-B.
+# Solo países con evidencia real observada en la muestra (DE, PL, FR, ES, IT, NL).
+# AT/BE no tienen muestra propia — no se han añadido marcadores para ellos.
+_EXTERNAL_TAIL_HEADERS = frozenset({
+    "Ähnliche Jobs",
+    "Häufige Suchvorgänge",
+    "Podobne oferty",
+    "Popularne wyszukiwania",
+    "Postes similaires",
+    "Recherches populaires",
+    "Stats pour cet emploi",
+    "Estadísticas para este empleo",
+    "Statistiche per questo lavoro",
+    "Statistieken voor deze baan",
+    # Variante EXACTA observada en el job real 5878715232 (IT): trafilatura pega el
+    # botón "Share:" a la cabecera en la misma línea, sin salto de línea entre ambos.
+    "Share:Statistiche per questo lavoro",
+})
+
+
+def _strip_external_tail(text: str) -> str:
+    """
+    Corta el texto en el primer encabezado de contenido ajeno al cuerpo de la oferta
+    (ofertas similares, búsquedas populares, estadísticas salariales) reconocido como
+    LÍNEA COMPLETA — nunca como subcadena dentro de una frase normal, para no cortar
+    por error un uso legítimo de esas palabras dentro de la descripción real.
+
+    Si ningún encabezado aparece como línea propia, devuelve el texto sin modificar.
+    Sanitización puramente textual, sobre el resultado ya extraído (trafilatura o
+    selectores CSS) — no toca el DOM ni sustituye ninguna validación de selectores.
+    """
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if " ".join(line.split()) in _EXTERNAL_TAIL_HEADERS:
+            return "\n".join(lines[:i]).strip()
+    return text
+
+
 def crawl_description(
     session: requests.Session, url: str
 ) -> tuple[Optional[str], bool]:
@@ -566,8 +610,10 @@ def crawl_description(
                 no_fallback=False,
                 favor_recall=True,
             )
-            if extracted and len(extracted.strip()) > 100:
-                return extracted.strip(), False
+            if extracted:
+                extracted = _strip_external_tail(extracted.strip())
+                if len(extracted) > 100:
+                    return extracted, False
 
         # Opción 2: selectores CSS específicos del DOM de Adzuna (fallback)
         soup = BeautifulSoup(response.text, "html.parser")
@@ -596,7 +642,7 @@ def crawl_description(
 
         if description_text:
             lines = [line for line in description_text.splitlines() if line.strip()]
-            description_text = "\n".join(lines)
+            description_text = _strip_external_tail("\n".join(lines))
 
         return (description_text if description_text else None), False
 
