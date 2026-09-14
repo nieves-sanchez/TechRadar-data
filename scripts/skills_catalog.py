@@ -260,6 +260,7 @@ SKILLS: list[tuple[str, str, list[str]]] = [
     ("ServiceNow",     "tool", [r"\bservicenow\b"]),
     ("Salesforce",     "tool", [r"\bsalesforce\b"]),
     ("Zendesk",        "tool", [r"\bzendesk\b"]),
+    ("S/4HANA",        "tool", [r"\bs/4\s*hana\b", r"\bs4hana\b"]),
 
     # -------------------------------------------------------------------------
     # Data engineering adicional

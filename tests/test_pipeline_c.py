@@ -255,6 +255,61 @@ def test_numeric_only_returns_none():
 
 
 # =============================================================================
+# _normalize_skill — hardening C2/C5 (notes/PENDING_CHANGES.md, "Detalle: C2")
+# =============================================================================
+#
+# Casos reales confirmados en la auditoría de Pipeline C (2026-09-14): Ollama
+# puede devolver frases de la propia oferta como si fueran skills. Ninguna de
+# estas guardas usa una lista de verbos ni un parser lingüístico.
+
+def test_react_and_nodejs_variants_still_normalize_after_hardening():
+    """El hardening C2/C5 no debe tocar los casos ya correctos (regresión)."""
+    assert _normalize_skill("React JS") == ("React", "framework")
+    assert _normalize_skill("reactjs") == ("React", "framework")
+    assert _normalize_skill("Node.js") == ("Node.js", "framework")
+    assert _normalize_skill("node") == ("Node.js", "framework")
+
+
+def test_action_phrase_with_and_is_rejected():
+    """Frase de la oferta ('Develop and maintain APIs'), no una skill."""
+    assert _normalize_skill("Develop and maintain APIs") is None
+
+
+def test_offer_gender_suffix_is_rejected():
+    """'(m/w/d)' es un sufijo de oferta alemana, no parte de una skill."""
+    assert _normalize_skill("ERP Platforms (m/w/d)") is None
+
+
+def test_generic_skill_phrase_is_rejected():
+    """'Communication skills' describe una capacidad, no nombra una tecnología."""
+    assert _normalize_skill("Communication skills") is None
+
+
+def test_ci_cd_with_spaces_canonicalizes():
+    """'CI / CD' (con espacios) resuelve igual que la entrada canónica 'CI/CD'."""
+    assert _normalize_skill("CI / CD") == ("CI/CD", "methodology")
+
+
+def test_s4hana_canonicalizes():
+    """'S/4Hana' normaliza a la entrada canónica 'S/4HANA' del catálogo."""
+    assert _normalize_skill("S/4Hana") == ("S/4HANA", "tool")
+
+
+def test_s4hana_transformation_maps_to_canonical_not_free_skill():
+    """
+    'S/4Hana Transformation' no debe crear una skill libre de texto: el concepto
+    ya tiene nombre canónico en el catálogo (S/4HANA) y se resuelve a él.
+    """
+    assert _normalize_skill("S/4Hana Transformation") == ("S/4HANA", "tool")
+
+
+def test_legit_multiword_tech_skills_still_accepted():
+    """Skills técnicas multi-palabra legítimas no deben verse afectadas por las guardas."""
+    assert _normalize_skill("Visual Studio Code") == ("Visual Studio Code", "tool")
+    assert _normalize_skill("Natural Language Processing") == ("Natural Language Processing", "tool")
+
+
+# =============================================================================
 # _build_role_updates_from_result — lógica pura sin BD
 # =============================================================================
 

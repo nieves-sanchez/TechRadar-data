@@ -100,6 +100,28 @@ def _build_catalog_lookup() -> None:
 _build_catalog_lookup()
 
 
+# C2/C5 (notes/PENDING_CHANGES.md, "Detalle: C2") — basura confirmada que Ollama puede
+# devolver como si fuera una skill. Tres guardas mínimas, cada una un único chequeo
+# barato, sin listas de verbos ni parser lingüístico:
+#
+# - Sufijo de oferta/persona pegado al final de una frase (m/w/d, m/f/d, H/F, "(*)"):
+#   únicamente los ya documentados en el proyecto — no se amplía a variantes no
+#   demostradas.
+# - Frase con conjunción ("Develop AND maintain APIs"): ninguna skill real del
+#   catálogo se nombra así, así que basta con detectar la palabra "and" suelta.
+# - "X skill(s)" ("Communication skills"): describe una capacidad, no nombra una
+#   tecnología — ninguna entrada del catálogo termina en "skill"/"skills".
+_OFFER_SUFFIX_RE = re.compile(r"\bm/w/d\b|\bm/f/d\b|\bh/f\b|\(\*\)", re.IGNORECASE)
+_HAS_AND_RE = re.compile(r"\band\b", re.IGNORECASE)
+_ENDS_IN_SKILL_RE = re.compile(r"\bskills?\s*$", re.IGNORECASE)
+
+# Colapsa espacios alrededor de "/" SOLO para comparar contra el catálogo, para que
+# "CI / CD" resuelva igual que "CI/CD" sin duplicar la entrada canónica ni tocar
+# skills_catalog.py. El texto original (con sus espacios) se conserva si acaba
+# aceptándose como skill libre en el paso 3.
+_SLASH_SPACING_RE = re.compile(r"\s*/\s*")
+
+
 def _normalize_skill(raw_name: str) -> tuple[str, str] | None:
     """
     Normaliza el nombre de una skill devuelta por Ollama.
@@ -107,8 +129,10 @@ def _normalize_skill(raw_name: str) -> tuple[str, str] | None:
     Prioridad:
     1. Coincidencia exacta case-insensitive con nombre canónico del catálogo.
     2. Coincidencia con patrón regex del catálogo → devuelve nombre canónico.
-    3. Skill técnica desconocida con longitud razonable → categoría 'tool'.
-    4. None → descartar (demasiado corto, largo, frase, sin letras, etc.).
+    3. Skill técnica desconocida con longitud razonable → categoría 'tool',
+       salvo que coincida con alguna de las guardas C2/C5 (ver arriba).
+    4. None → descartar (demasiado corto, largo, frase, sin letras, basura
+       confirmada, etc.).
 
     Args:
         raw_name: Nombre de skill devuelto por Ollama.
@@ -124,7 +148,10 @@ def _normalize_skill(raw_name: str) -> tuple[str, str] | None:
     if len(words) > 5:
         return None
 
-    lower = raw.lower()
+    # Normalización SOLO para el lookup contra el catálogo (pasos 1 y 2) — el
+    # nombre canónico devuelto siempre viene del catálogo, nunca de esta variante.
+    for_matching = _SLASH_SPACING_RE.sub("/", raw)
+    lower = for_matching.lower()
 
     # 1. Coincidencia exacta case-insensitive contra catálogo
     if lower in _CATALOG_LOWER:
@@ -132,14 +159,17 @@ def _normalize_skill(raw_name: str) -> tuple[str, str] | None:
 
     # 2. Coincidencia con patrón regex del catálogo
     for pattern, canonical, category in _CATALOG_PATTERNS:
-        if pattern.search(raw):
+        if pattern.search(for_matching):
             return (canonical, category)
 
-    # 3. Skill desconocida: al menos una letra y <= 4 palabras
-    if re.search(r"[a-zA-Z]", raw) and len(words) <= 4:
-        return (raw, "tool")
+    # 3. Skill desconocida: al menos una letra, <= 4 palabras, y ninguna de las
+    #    guardas C2/C5 confirmadas.
+    if not re.search(r"[a-zA-Z]", raw) or len(words) > 4:
+        return None
+    if _OFFER_SUFFIX_RE.search(raw) or _HAS_AND_RE.search(raw) or _ENDS_IN_SKILL_RE.search(raw):
+        return None
 
-    return None
+    return (raw, "tool")
 
 
 # =============================================================================
