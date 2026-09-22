@@ -14,22 +14,35 @@ Modos disponibles en este turno (ver notes/PENDING_CHANGES.md para el estado):
         JSONL.GZ + manifest.json bajo RUTA/retention_<timestamp>/.
     --verify RUTA/manifest.json — verifica un backup ya creado usando
         exclusivamente los archivos locales (no requiere Supabase).
+    --restore-plan RUTA/manifest.json — READ-ONLY: calcula exactamente qué
+        haría un restore real (inserts/conflictos/links faltantes) sin
+        escribir nada, ni en disco ni en Supabase.
+    --restore RUTA/manifest.json --confirm-restore — restaura jobs/job_skills
+        desde un backup ya verificado. `--confirm-restore` es obligatorio;
+        sin él, `--restore` no hace nada (ni siquiera abre conexión).
 
 NO implementado en este turno, a propósito (ver notas de diseño en
 notes/PROJECT_MASTER_CONTEXT.md Parte 10 §96 para el porqué):
     - retention / DELETE real contra Supabase
-    - restore real
     - VACUUM
     - política de backups para la retención recurrente (sin decidir todavía)
 
-Este módulo NUNCA ejecuta DELETE, UPDATE, INSERT, ALTER, DROP, TRUNCATE,
-VACUUM ni REINDEX. Toda la interacción con Supabase es SELECT / catálogo de
-PostgreSQL, dentro de una única transacción con aislamiento REPEATABLE READ
-(transaccional, no de sesión — ver `snapshot_transaction()`). No se usa
-`conn.set_session(readonly=True)` ni `SET SESSION CHARACTERISTICS ...` ni
-`SET default_transaction_read_only` — esa combinación ya contaminó conexiones
-reutilizadas del Transaction Pooler de Supabase en el pasado (regla
-permanente, PROJECT_MASTER_CONTEXT.md §82).
+Este módulo NUNCA ejecuta DELETE, UPDATE, ALTER, DROP, TRUNCATE, VACUUM ni
+REINDEX/CLUSTER. El único `INSERT` permitido es el de `--restore`, siempre
+`ON CONFLICT ... DO NOTHING` (jobs por `id`, job_skills por `(job_id,
+skill_id)`) — nunca sobrescribe una fila existente, nunca hace `DO UPDATE`
+(test_no_forbidden_keywords_in_sql_constants / test_insert_sql_is_confined_
+to_whitelisted_restore_constants en tests/test_data_retention.py lo
+verifican). Toda lectura contra Supabase es SELECT / catálogo de PostgreSQL.
+Los modos de solo lectura (dry-run, --restore-plan) usan una única
+transacción con aislamiento REPEATABLE READ (transaccional, no de sesión —
+ver `snapshot_transaction()`); `--restore` real usa una transacción propia
+POR BATCH, con commit inmediato tras cada batch (ver `_write_batch_
+transaction()`), para que un restore interrumpido sea reanudable sin
+duplicar nada. No se usa `conn.set_session(readonly=True)` ni
+`SET SESSION CHARACTERISTICS ...` ni `SET default_transaction_read_only` —
+esa combinación ya contaminó conexiones reutilizadas del Transaction Pooler
+de Supabase en el pasado (regla permanente, PROJECT_MASTER_CONTEXT.md §82).
 
 Cutoff: por defecto se captura con `SELECT NOW()` dentro de la misma
 transacción/snapshot (ver `_capture_cutoff()`), no con el reloj local de
@@ -45,10 +58,46 @@ incompleto (`.retention_<ts>.incomplete`) y solo lo renombra al nombre final
 conexión, apagado del PC) nunca queda un `retention_<ts>/` a medias que
 parezca un backup válido.
 
+Diseño del restore (§99 de PROJECT_MASTER_CONTEXT.md tiene el contexto del
+primer backup real; el diseño de esta sección se documenta en el turno que
+lo implementa):
+    Orden: jobs primero, luego job_skills (FK real job_skills.job_id →
+    jobs.id). `skills` NUNCA se restaura — el snapshot solo sirve para
+    diagnóstico y para el gate de "todos los skill_id necesarios existen".
+
+    Por cada job del backup, comparando contra el estado ACTUAL (nunca el
+    histórico):
+      - No existe hoy       → candidato a INSERT.
+      - Existe e idéntico    → no se inserta (ya está), pero sus job_skills
+        respaldados SÍ son restaurables (permite reanudar un restore
+        parcial sin duplicar nada).
+      - Existe pero DISTINTO → CONFLICTO: nunca se sobrescribe, y sus
+        job_skills respaldados NUNCA se restauran automáticamente. Se
+        reporta para revisión manual (columna a columna, no solo un hash).
+
+    Comparación fila a fila reutilizando `_json_value()`/la misma
+    canonicalización del backup (nunca `default=str`) — no se duplica lógica
+    de serialización entre export y restore.
+
+    Antes de escribir nada: si algún `skill_id` referenciado por el
+    job_skills del backup ya no existe en `skills`, el restore real
+    ABORTA por completo (no se recrea el catálogo automáticamente).
+
+    Escritura en batches (`--restore-batch-size`, por defecto
+    RESTORE_BATCH_SIZE_DEFAULT), cada batch en su propia transacción con
+    commit inmediato — mismo patrón que `enrich_jobs()` en
+    `repair_crawl.py` (una transacción por lote, resumible). Si la
+    conexión se pierde a mitad, los batches ya commiteados quedan
+    persistidos tal cual; relanzar el mismo comando reclasifica todo desde
+    cero y completa solo lo que falte (`ON CONFLICT DO NOTHING` + la regla
+    "existe e idéntico → restaura job_skills faltantes" de arriba).
+
 Uso:
     python -m scripts.data_retention
     python -m scripts.data_retention --backup --dest "C:\\ruta\\TechRadar-data-backups"
     python -m scripts.data_retention --verify "C:\\ruta\\retention_.../manifest.json"
+    python -m scripts.data_retention --restore-plan "C:\\ruta\\retention_.../manifest.json"
+    python -m scripts.data_retention --restore "C:\\ruta\\retention_.../manifest.json" --confirm-restore
 """
 
 import argparse
@@ -77,6 +126,8 @@ logger = logging.getLogger("techradar.data_retention")
 
 RETENTION_DAYS_DEFAULT = 60
 ITERSIZE = 2000
+RESTORE_BATCH_SIZE_DEFAULT = 500  # mismo orden de magnitud que load.BATCH_SIZE
+MAX_CONFLICT_SAMPLES = 50  # tope de diagnostico detallado, no de deteccion
 
 # Baseline esperado de columnas de `jobs`, verificado contra el catálogo real
 # de PostgreSQL (no contra sql/schema.sql) el 2026-09-21 — ver
@@ -168,9 +219,28 @@ JOB_SKILLS_COUNT_QUERY = """
 
 SKILLS_COUNT_QUERY = "SELECT COUNT(*) AS n FROM skills"
 
+# --- Restore: solo lectura -------------------------------------------------
+# {cols} se rellena igual que JOBS_QUERY_TEMPLATE, con columnas reales.
+JOBS_BY_IDS_TEMPLATE = "SELECT {cols} FROM jobs WHERE id = ANY(%s)"
+JOB_SKILLS_BY_JOB_IDS_QUERY = "SELECT job_id, skill_id FROM job_skills WHERE job_id = ANY(%s)"
+SKILLS_BY_IDS_QUERY = "SELECT id FROM skills WHERE id = ANY(%s)"
+
+# --- Restore: los DOS únicos INSERT del módulo, siempre ON CONFLICT DO
+# NOTHING -- ver test_insert_sql_is_confined_to_whitelisted_restore_constants
+# y test_insert_constants_are_always_on_conflict_do_nothing en
+# tests/test_data_retention.py, que fallan si esto deja de cumplirse.
+INSERT_JOBS_TEMPLATE = "INSERT INTO jobs ({cols}) VALUES %s ON CONFLICT (id) DO NOTHING"
+INSERT_JOB_SKILLS_QUERY = (
+    "INSERT INTO job_skills (job_id, skill_id) VALUES %s ON CONFLICT (job_id, skill_id) DO NOTHING"
+)
+
 
 class SchemaMismatchError(RuntimeError):
     """El schema real de `jobs` cambió de forma incompatible con lo esperado."""
+
+
+class RestoreAbortedError(RuntimeError):
+    """El restore se abortó antes de escribir nada — ver el motivo en el mensaje."""
 
 
 # =============================================================================
@@ -388,6 +458,61 @@ def _capture_cutoff(conn, override: datetime | None) -> datetime:
     with conn.cursor() as cur:
         cur.execute(NOW_QUERY)
         return cur.fetchone()[0]
+
+
+@contextmanager
+def _write_batch_transaction(conn):
+    """
+    Transacción de un solo batch de ESCRITURA para el restore: si el bloque
+    `with` termina sin excepción, hace COMMIT; si lanza, hace ROLLBACK y
+    propaga. Cada batch es su propia unidad atómica y reanudable — mismo
+    patrón que `enrich_jobs()` en `repair_crawl.py` (una transacción por
+    lote, resumible vía `ON CONFLICT DO NOTHING` + reclasificación en el
+    siguiente intento, nunca reintento automático a mitad de un batch).
+
+    `SET LOCAL TIME ZONE 'UTC'` para que la comparación de timestamptz de
+    `classify_jobs_batch()` sea consistente con la que usó el backup.
+    """
+    conn.autocommit = False
+    with conn.cursor() as cur:
+        cur.execute(SET_TIMEZONE_SQL)
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def _read_jsonl_gz(path: Path):
+    """
+    Generador que entrega cada fila del backup como dict (los mismos tipos
+    JSON nativos que escribió `export_rows_to_jsonl_gz`), línea a línea, sin
+    cargar el archivo completo en memoria — simétrico al lado de export.
+    Nunca abre en modo escritura: el backup es inmutable.
+    """
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def _batched(iterable, size):
+    """Agrupa `iterable` en listas de como mucho `size` elementos."""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _backup_file_path(backup_dir: Path, manifest: dict, key: str) -> Path:
+    return backup_dir / manifest["files"][key]["filename"]
 
 
 @contextmanager
@@ -758,6 +883,303 @@ def verify_backup(manifest_path: Path) -> list[str]:
 
 
 # =============================================================================
+# restore — lee exclusivamente el backup ya verificado; nunca sobrescribe
+# =============================================================================
+
+
+def classify_jobs_batch(cur, columns: list[str], batch_rows: list[dict]):
+    """
+    Clasifica un batch de filas del backup (dicts ya canonicalizados, tal
+    cual los devuelve `_read_jsonl_gz`) contra el estado ACTUAL de `jobs`.
+    Solo SELECT — no escribe nada.
+
+    Compara columna a columna reutilizando `_json_value()` (la misma
+    canonicalización del export) sobre la fila real de Postgres, para que
+    "igual" signifique exactamente lo mismo en ambos lados (NULL vs NULL,
+    bool, int, timestamptz ya normalizado a UTC por la transacción activa).
+
+    Devuelve (insert_rows, identical_ids, conflict_ids, conflicts):
+      - insert_rows: sublista de batch_rows cuyo id NO existe hoy en jobs.
+      - identical_ids: ids que existen y son idénticos al backup.
+      - conflict_ids: ids que existen pero difieren — nunca se tocan.
+      - conflicts: [{"id":, "diffs": [(columna, valor_backup, valor_live), ...]}]
+        para CADA conflicto del batch (el llamador decide si acota la
+        muestra para diagnóstico; aquí nunca se trunca la detección).
+    """
+    ids = [row["id"] for row in batch_rows]
+    cur.execute(JOBS_BY_IDS_TEMPLATE.format(cols=", ".join(columns)), (ids,))
+    live_by_id = {
+        row[0]: {col: _json_value(v) for col, v in zip(columns, row)} for row in cur.fetchall()
+    }
+
+    insert_rows: list[dict] = []
+    identical_ids: set[int] = set()
+    conflict_ids: set[int] = set()
+    conflicts: list[dict] = []
+    for backup_row in batch_rows:
+        id_ = backup_row["id"]
+        live_row = live_by_id.get(id_)
+        if live_row is None:
+            insert_rows.append(backup_row)
+        elif live_row == backup_row:
+            identical_ids.add(id_)
+        else:
+            conflict_ids.add(id_)
+            diffs = [
+                (col, backup_row.get(col), live_row.get(col))
+                for col in columns
+                if backup_row.get(col) != live_row.get(col)
+            ]
+            conflicts.append({"id": id_, "diffs": diffs})
+    return insert_rows, identical_ids, conflict_ids, conflicts
+
+
+def _process_jobs_restore(conn, columns: list[str], jobs_path: Path, batch_size: int, *, write: bool):
+    """
+    Recorre el backup de `jobs` en batches y clasifica cada uno contra el
+    estado actual. Si `write=True`, inserta los "missing" de cada batch
+    (`ON CONFLICT (id) DO NOTHING`) dentro de su propia transacción con
+    commit inmediato (`_write_batch_transaction`) — nunca una transacción
+    gigante para las 197K filas. Si `write=False` (`--restore-plan`), solo
+    hace SELECT, pensado para ejecutarse dentro de un `snapshot_transaction`
+    ya abierto por el llamador.
+
+    Devuelve dict con counts + `conflict_ids` (set COMPLETO, sin acotar —
+    lo usa `_process_job_skills_restore` para no restaurar skills de un job
+    conflictivo) + `conflicts_sample` (acotado a MAX_CONFLICT_SAMPLES, solo
+    para diagnóstico impreso).
+    """
+    total = insert_count = identical_count = 0
+    conflict_ids: set[int] = set()
+    conflicts_sample: list[dict] = []
+
+    for batch in _batched(_read_jsonl_gz(jobs_path), batch_size):
+        total += len(batch)
+        if write:
+            with _write_batch_transaction(conn):
+                with conn.cursor() as cur:
+                    insert_rows, identical_ids, batch_conflict_ids, batch_conflicts = (
+                        classify_jobs_batch(cur, columns, batch)
+                    )
+                    if insert_rows:
+                        values = [tuple(row[c] for c in columns) for row in insert_rows]
+                        psycopg2.extras.execute_values(
+                            cur,
+                            INSERT_JOBS_TEMPLATE.format(cols=", ".join(columns)),
+                            values,
+                            page_size=len(values),
+                        )
+        else:
+            with conn.cursor() as cur:
+                insert_rows, identical_ids, batch_conflict_ids, batch_conflicts = (
+                    classify_jobs_batch(cur, columns, batch)
+                )
+
+        insert_count += len(insert_rows)
+        identical_count += len(identical_ids)
+        conflict_ids |= batch_conflict_ids
+        room = MAX_CONFLICT_SAMPLES - len(conflicts_sample)
+        if room > 0:
+            conflicts_sample.extend(batch_conflicts[:room])
+        logger.info(
+            "jobs: %d procesados (insert=%d identical=%d conflict=%d)",
+            total,
+            insert_count,
+            identical_count,
+            len(conflict_ids),
+        )
+
+    return {
+        "total": total,
+        "insert_count": insert_count,
+        "identical_count": identical_count,
+        "conflict_ids": conflict_ids,
+        "conflicts_sample": conflicts_sample,
+    }
+
+
+def _process_job_skills_restore(
+    conn, job_skills_path: Path, batch_size: int, conflict_ids: set[int], *, write: bool
+):
+    """
+    Recorre el backup de `job_skills` en batches. Un par (job_id, skill_id)
+    se descarta sin más si `job_id` está en `conflict_ids` (nunca se
+    restauran skills de un job conflictivo). Del resto, distingue los que
+    ya existen (no se duplican) de los que faltan. Si `write=True`, inserta
+    los que faltan (`ON CONFLICT (job_id, skill_id) DO NOTHING`) en su
+    propia transacción por batch. Requiere que el preflight de skill_id
+    (`find_missing_skill_ids`) ya haya pasado antes de llamar con
+    `write=True`.
+    """
+    restorable = existing = blocked = 0
+
+    for batch in _batched(_read_jsonl_gz(job_skills_path), batch_size):
+        pairs = [(row["job_id"], row["skill_id"]) for row in batch]
+        candidate_pairs = [(j, s) for j, s in pairs if j not in conflict_ids]
+        blocked += len(pairs) - len(candidate_pairs)
+        if not candidate_pairs:
+            continue
+        job_ids_in_batch = list({j for j, _ in candidate_pairs})
+
+        if write:
+            with _write_batch_transaction(conn):
+                with conn.cursor() as cur:
+                    cur.execute(JOB_SKILLS_BY_JOB_IDS_QUERY, (job_ids_in_batch,))
+                    existing_pairs = {(r[0], r[1]) for r in cur.fetchall()}
+                    missing_pairs = [p for p in candidate_pairs if p not in existing_pairs]
+                    if missing_pairs:
+                        psycopg2.extras.execute_values(
+                            cur, INSERT_JOB_SKILLS_QUERY, missing_pairs, page_size=len(missing_pairs)
+                        )
+        else:
+            with conn.cursor() as cur:
+                cur.execute(JOB_SKILLS_BY_JOB_IDS_QUERY, (job_ids_in_batch,))
+                existing_pairs = {(r[0], r[1]) for r in cur.fetchall()}
+                missing_pairs = [p for p in candidate_pairs if p not in existing_pairs]
+
+        restorable += len(missing_pairs)
+        existing += len(candidate_pairs) - len(missing_pairs)
+
+    return {"restorable": restorable, "existing": existing, "blocked_by_conflict": blocked}
+
+
+def find_missing_skill_ids(conn, job_skills_path: Path, skills_snapshot_path: Path) -> list[dict]:
+    """
+    Verifica que todos los `skill_id` referenciados por el `job_skills` del
+    backup existen HOY en `skills`. Devuelve una lista de dicts
+    {id, name, category} (leídos del `skills_snapshot` del propio backup,
+    nunca reconstruidos) para los que faltan — vacía si todo está bien.
+
+    No recrea nada. Un restore real debe ABORTAR por completo si esta lista
+    no está vacía (ver `run_restore`); recrear el catálogo de skills sería
+    una decisión manual distinta, fuera de alcance de este módulo.
+    """
+    needed = {row["skill_id"] for row in _read_jsonl_gz(job_skills_path)}
+    if not needed:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(SKILLS_BY_IDS_QUERY, (list(needed),))
+        existing = {row[0] for row in cur.fetchall()}
+    missing_ids = needed - existing
+    if not missing_ids:
+        return []
+    snapshot_by_id = {row["id"]: row for row in _read_jsonl_gz(skills_snapshot_path)}
+    return [snapshot_by_id[sid] for sid in sorted(missing_ids) if sid in snapshot_by_id]
+
+
+def build_restore_plan(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
+    """
+    Modo READ-ONLY (`--restore-plan`): calcula exactamente lo que haría un
+    restore real, sin escribir nada, dentro de UNA única transacción
+    REPEATABLE READ (`snapshot_transaction`, igual que el dry-run del
+    backup). Nunca usa `conn.set_session(readonly=True)`.
+    """
+    columns = manifest["jobs_columns"]
+    jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
+    job_skills_path = _backup_file_path(backup_dir, manifest, "job_skills")
+    skills_snapshot_path = _backup_file_path(backup_dir, manifest, "skills_snapshot")
+
+    with snapshot_transaction(conn):
+        missing_skills = find_missing_skill_ids(conn, job_skills_path, skills_snapshot_path)
+        jobs_result = _process_jobs_restore(conn, columns, jobs_path, batch_size, write=False)
+        job_skills_result = _process_job_skills_restore(
+            conn, job_skills_path, batch_size, jobs_result["conflict_ids"], write=False
+        )
+
+    return {
+        "jobs_total": jobs_result["total"],
+        "jobs_insertable": jobs_result["insert_count"],
+        "jobs_identical": jobs_result["identical_count"],
+        "jobs_conflict": len(jobs_result["conflict_ids"]),
+        "conflicts_sample": jobs_result["conflicts_sample"],
+        "job_skills_restorable": job_skills_result["restorable"],
+        "job_skills_existing": job_skills_result["existing"],
+        "job_skills_blocked_by_conflict": job_skills_result["blocked_by_conflict"],
+        "missing_skill_ids": missing_skills,
+        "would_abort": bool(missing_skills),
+    }
+
+
+def run_restore(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
+    """
+    Restore REAL: `INSERT ... ON CONFLICT DO NOTHING`, batch a batch, cada
+    batch en su propia transacción con commit inmediato (ver
+    `_process_jobs_restore` / `_process_job_skills_restore` /
+    `_write_batch_transaction`) — mismo patrón que `enrich_jobs()` en
+    `repair_crawl.py`: si se pierde la conexión a mitad, los batches ya
+    commiteados quedan persistidos, y relanzar el mismo comando reclasifica
+    todo desde cero y completa solo lo que falte, sin duplicar nada.
+
+    ABORTA (`RestoreAbortedError`) antes de escribir nada si falta algún
+    `skill_id` necesario en `skills`.
+    """
+    columns = manifest["jobs_columns"]
+    jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
+    job_skills_path = _backup_file_path(backup_dir, manifest, "job_skills")
+    skills_snapshot_path = _backup_file_path(backup_dir, manifest, "skills_snapshot")
+
+    with snapshot_transaction(conn):
+        missing_skills = find_missing_skill_ids(conn, job_skills_path, skills_snapshot_path)
+    if missing_skills:
+        detalle = ", ".join(f"id={s['id']} name={s['name']!r}" for s in missing_skills[:10])
+        raise RestoreAbortedError(
+            f"Restore abortado antes de escribir nada: {len(missing_skills)} skill_id "
+            f"necesarios ya no existen en `skills` ({detalle}{'...' if len(missing_skills) > 10 else ''})."
+        )
+
+    jobs_result = _process_jobs_restore(conn, columns, jobs_path, batch_size, write=True)
+    job_skills_result = _process_job_skills_restore(
+        conn, job_skills_path, batch_size, jobs_result["conflict_ids"], write=True
+    )
+
+    return {
+        "jobs_total": jobs_result["total"],
+        "jobs_insertable": jobs_result["insert_count"],
+        "jobs_identical": jobs_result["identical_count"],
+        "jobs_conflict": len(jobs_result["conflict_ids"]),
+        "conflicts_sample": jobs_result["conflicts_sample"],
+        "job_skills_restorable": job_skills_result["restorable"],
+        "job_skills_existing": job_skills_result["existing"],
+        "job_skills_blocked_by_conflict": job_skills_result["blocked_by_conflict"],
+        "missing_skill_ids": [],
+        "would_abort": False,
+    }
+
+
+def print_restore_report(plan: dict, *, executed: bool) -> None:
+    """Formato compartido entre `--restore-plan` (hipotético) y `--restore` (ya ejecutado)."""
+    title = "RESTORE — ejecutado" if executed else "RESTORE-PLAN — READ-ONLY, nada escrito"
+    print("=" * 78)
+    print(f"{title} (data_retention.py)")
+    print("=" * 78)
+    print(f"jobs en el backup: {plan['jobs_total']}")
+    verbo_insert = "insertados" if executed else "candidatos a INSERT"
+    print(f"  no existían / {verbo_insert}:                 {plan['jobs_insertable']}")
+    print(f"  ya existían e idénticos (safe-existing):       {plan['jobs_identical']}")
+    print(f"  ya existían pero DIFERENTES (conflicto, no tocados): {plan['jobs_conflict']}")
+    print("job_skills en el backup:")
+    verbo_links = "insertados" if executed else "restaurables (se insertarían)"
+    print(f"  faltaban, {verbo_links}:            {plan['job_skills_restorable']}")
+    print(f"  ya existían (no duplicados):                    {plan['job_skills_existing']}")
+    print(f"  bloqueados por job conflictivo (no tocados):    {plan['job_skills_blocked_by_conflict']}")
+    if plan["missing_skill_ids"]:
+        print(
+            f"{'ABORTADO' if executed else 'ABORTARÍA'}: "
+            f"{len(plan['missing_skill_ids'])} skill_id necesarios ya no existen en `skills`:"
+        )
+        for s in plan["missing_skill_ids"][:20]:
+            print(f"  id={s['id']} name={s['name']!r} category={s['category']!r}")
+    else:
+        print("Todos los skill_id necesarios existen actualmente en `skills`.")
+    if plan["conflicts_sample"]:
+        print(f"Muestra de conflictos (hasta {MAX_CONFLICT_SAMPLES}, de {plan['jobs_conflict']} totales):")
+        for c in plan["conflicts_sample"][:10]:
+            cols = [d[0] for d in c["diffs"]]
+            print(f"  job id={c['id']}: {len(c['diffs'])} columna(s) distinta(s) -> {cols}")
+    print("=" * 78)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -803,6 +1225,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "requiere Supabase). Por defecto: SELECT NOW() de PostgreSQL, capturado una sola vez "
         "dentro de la misma transacción/snapshot que el resto del backup.",
     )
+    parser.add_argument(
+        "--restore-plan",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help="READ-ONLY: calcula qué haría un restore real (inserts/conflictos/links "
+        "faltantes) contra el estado actual, sin escribir nada. Solo SELECT.",
+    )
+    parser.add_argument(
+        "--restore",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help="Restaura jobs/job_skills desde un backup ya verificado. Nunca sobrescribe filas "
+        "existentes (ON CONFLICT DO NOTHING); un job existente pero distinto al backup se deja "
+        "como conflicto, sin tocar. Requiere --confirm-restore explícito.",
+    )
+    parser.add_argument(
+        "--confirm-restore",
+        action="store_true",
+        help="Opt-in obligatorio para que --restore escriba de verdad. Sin este flag, --restore "
+        "no hace nada — ni siquiera abre conexión a Supabase.",
+    )
+    parser.add_argument(
+        "--restore-batch-size",
+        type=int,
+        default=RESTORE_BATCH_SIZE_DEFAULT,
+        help=f"Filas por batch/transacción en el restore (por defecto {RESTORE_BATCH_SIZE_DEFAULT}).",
+    )
     return parser
 
 
@@ -820,6 +1271,24 @@ def _resolve_cutoff_override(raw: str | None) -> datetime | None:
     return cutoff
 
 
+def _load_verified_manifest(manifest_arg: str, *, action_label: str) -> dict | None:
+    """
+    Ejecuta `verify_backup()` sobre `manifest_arg` y, si pasa, devuelve el
+    manifiesto ya parseado. Si falla, imprime los problemas y devuelve None
+    — el llamador debe abortar (`sys.exit`) sin abrir conexión a Supabase.
+    Compartido por --restore-plan y --restore: ninguno de los dos escribe
+    nada si el backup de origen no pasa --verify primero.
+    """
+    manifest_path = Path(manifest_arg)
+    problems = verify_backup(manifest_path)
+    if problems:
+        print(f"{action_label} ABORTADO: el backup no pasa --verify:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return None
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
@@ -831,6 +1300,43 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"  - {p}")
             sys.exit(1)
         print("VERIFY: OK — todo coincide (archivos, hashes, counts y relaciones).")
+        return
+
+    if args.restore_plan and args.restore:
+        print("ERROR: usa --restore-plan o --restore, no ambos a la vez.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.restore_plan:
+        manifest_path = Path(args.restore_plan)
+        manifest = _load_verified_manifest(args.restore_plan, action_label="RESTORE-PLAN")
+        if manifest is None:
+            sys.exit(1)
+        conn = _get_connection()
+        try:
+            plan = build_restore_plan(conn, manifest, manifest_path.parent, args.restore_batch_size)
+        finally:
+            conn.close()
+        print_restore_report(plan, executed=False)
+        return
+
+    if args.restore:
+        if not args.confirm_restore:
+            print(
+                "ERROR: --restore requiere --confirm-restore explícito. Sin él, no se abre "
+                "conexión a Supabase ni se escribe nada. Usa --restore-plan para ver qué haría.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        manifest_path = Path(args.restore)
+        manifest = _load_verified_manifest(args.restore, action_label="RESTORE")
+        if manifest is None:
+            sys.exit(1)
+        conn = _get_connection()
+        try:
+            result = run_restore(conn, manifest, manifest_path.parent, args.restore_batch_size)
+        finally:
+            conn.close()
+        print_restore_report(result, executed=True)
         return
 
     cutoff_override = _resolve_cutoff_override(args.cutoff)
