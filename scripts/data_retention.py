@@ -20,29 +20,45 @@ Modos disponibles en este turno (ver notes/PENDING_CHANGES.md para el estado):
     --restore RUTA/manifest.json --confirm-restore — restaura jobs/job_skills
         desde un backup ya verificado. `--confirm-restore` es obligatorio;
         sin él, `--restore` no hace nada (ni siquiera abre conexión).
+    --delete-plan RUTA/manifest.json — READ-ONLY: calcula exactamente qué
+        borraría un DELETE real (already_missing/deletable/drift) usando
+        los `candidate_ids` de ESE manifiesto como única autoridad — nunca
+        recalcula `NOW() - 60 días`. Sin escribir nada.
+    --delete RUTA/manifest.json --confirm-delete — borra de `jobs` los
+        candidatos del backup que sigan existiendo e idénticos.
+        `--confirm-delete` es obligatorio; sin él, `--delete` no hace nada
+        (ni siquiera abre conexión). **NO ejecutado nunca contra Supabase
+        real todavía — pendiente de autorización explícita separada.**
 
 NO implementado en este turno, a propósito (ver notas de diseño en
 notes/PROJECT_MASTER_CONTEXT.md Parte 10 §96 para el porqué):
-    - retention / DELETE real contra Supabase
     - VACUUM
     - política de backups para la retención recurrente (sin decidir todavía)
+    - retención RECURRENTE automatizada (cron) — este turno solo prepara el
+      DELETE de un backup concreto, ejecutado manualmente y una vez
 
-Este módulo NUNCA ejecuta DELETE, UPDATE, ALTER, DROP, TRUNCATE, VACUUM ni
-REINDEX/CLUSTER. El único `INSERT` permitido es el de `--restore`, siempre
-`ON CONFLICT ... DO NOTHING` (jobs por `id`, job_skills por `(job_id,
-skill_id)`) — nunca sobrescribe una fila existente, nunca hace `DO UPDATE`
-(test_no_forbidden_keywords_in_sql_constants / test_insert_sql_is_confined_
-to_whitelisted_restore_constants en tests/test_data_retention.py lo
-verifican). Toda lectura contra Supabase es SELECT / catálogo de PostgreSQL.
-Los modos de solo lectura (dry-run, --restore-plan) usan una única
-transacción con aislamiento REPEATABLE READ (transaccional, no de sesión —
-ver `snapshot_transaction()`); `--restore` real usa una transacción propia
-POR BATCH, con commit inmediato tras cada batch (ver `_write_batch_
-transaction()`), para que un restore interrumpido sea reanudable sin
-duplicar nada. No se usa `conn.set_session(readonly=True)` ni
-`SET SESSION CHARACTERISTICS ...` ni `SET default_transaction_read_only` —
-esa combinación ya contaminó conexiones reutilizadas del Transaction Pooler
-de Supabase en el pasado (regla permanente, PROJECT_MASTER_CONTEXT.md §82).
+Este módulo NUNCA ejecuta UPDATE, ALTER, DROP, TRUNCATE, VACUUM ni
+REINDEX/CLUSTER. Los únicos `INSERT`/`DELETE` permitidos son los de
+`--restore`/`--delete`, siempre acotados y verificados por test:
+`INSERT ... ON CONFLICT ... DO NOTHING` (nunca `DO UPDATE`, nunca
+sobrescribe una fila existente) y `DELETE FROM jobs WHERE id = ANY(%s)`
+(el único DELETE del módulo, nunca contra `job_skills`/`skills` —
+`job_skills.job_id → jobs.id ON DELETE CASCADE`, la única FK real hacia
+`jobs`, se encarga de sus vínculos). Ver
+test_no_forbidden_keywords_in_sql_constants /
+test_insert_sql_is_confined_to_whitelisted_restore_constants /
+test_delete_sql_is_confined_to_whitelisted_constant en
+tests/test_data_retention.py. Toda lectura contra Supabase es SELECT /
+catálogo de PostgreSQL. Los modos de solo lectura (dry-run, --restore-plan,
+--delete-plan) usan una única transacción con aislamiento REPEATABLE READ
+(transaccional, no de sesión — ver `snapshot_transaction()`); `--restore`/
+`--delete` reales usan una transacción propia POR BATCH, con commit
+inmediato tras cada batch (ver `_write_batch_transaction()`), para que una
+ejecución interrumpida sea reanudable sin duplicar ni corromper nada. No se
+usa `conn.set_session(readonly=True)` ni `SET SESSION CHARACTERISTICS ...`
+ni `SET default_transaction_read_only` — esa combinación ya contaminó
+conexiones reutilizadas del Transaction Pooler de Supabase en el pasado
+(regla permanente, PROJECT_MASTER_CONTEXT.md §82).
 
 Cutoff: por defecto se captura con `SELECT NOW()` dentro de la misma
 transacción/snapshot (ver `_capture_cutoff()`), no con el reloj local de
@@ -92,12 +108,74 @@ lo implementa):
     cero y completa solo lo que falte (`ON CONFLICT DO NOTHING` + la regla
     "existe e idéntico → restaura job_skills faltantes" de arriba).
 
+Diseño del delete (turno posterior, tras el primer backup+restore reales;
+autoridad exclusiva: `candidate_ids`/`jobs` DEL MANIFIESTO indicado, nunca
+un recálculo de `NOW() - 60 días` en el momento de borrar — evita drift
+temporal entre el snapshot que se decidió preservar y lo que realmente se
+borra):
+    Reutiliza EXACTAMENTE `classify_jobs_batch()` — la misma comparación
+    fila a fila del restore, para que "seguro para borrar" y "seguro para
+    restaurar sin pisar nada" sean la misma definición, no dos lógicas
+    paralelas que puedan divergir:
+      - No existe hoy       → `already_missing`, no-op (ya no está; puede
+        ser un DELETE anterior ya aplicado — relanzar es idempotente).
+      - Existe e idéntico    → candidato REAL a DELETE.
+      - Existe pero DISTINTO → DRIFT: NUNCA se borra (protege una posible
+        reingesta/actualización de Pipeline A posterior al backup), se
+        reporta columna a columna para revisión manual, igual que un
+        conflicto de restore.
+
+    SQL: `DELETE FROM jobs WHERE id = ANY(%s)`, únicamente sobre los ids
+    `existing_identical` de cada batch. `job_skills.job_id → jobs.id ON
+    DELETE CASCADE` (única FK real hacia `jobs`, confirmada contra el
+    catálogo de PostgreSQL — PROJECT_MASTER_CONTEXT.md §96) elimina sus
+    vínculos automáticamente: no hay DELETE manual de `job_skills`, y
+    `skills` nunca se toca.
+
+    TOCTOU cerrado con `SELECT ... FOR UPDATE` (auditoría 2026-09-22, antes
+    de autorizar el primer DELETE real): comparar y borrar ocurrían dentro
+    de la misma transacción, pero el `SELECT` de clasificación no
+    bloqueaba las filas leídas — nada impedía que otra transacción
+    modificara una fila "identical" entre la comparación y el `DELETE`
+    posterior. `_process_jobs_delete(write=True)` ahora clasifica con
+    `classify_jobs_batch(..., for_update=True)`, que bloquea únicamente
+    las filas del batch actual (nunca las 197K a la vez) hasta el
+    COMMIT/ROLLBACK de esa transacción — cualquier escritura concurrente
+    sobre esas filas queda bloqueada hasta entonces, y al liberarse ve la
+    fila ya borrada (si se borró) o intacta (si era drift y nunca se
+    tocó). `--delete-plan`/`--restore`/`--restore-plan` NUNCA usan
+    `FOR UPDATE` — no borran nada, así que no hay nada que proteger; el
+    `INSERT ... ON CONFLICT DO NOTHING` del restore ya es seguro ante una
+    inserción concurrente por construcción, sin necesitar bloqueo.
+
+    Batches (`--delete-batch-size`, por defecto DELETE_BATCH_SIZE_DEFAULT)
+    con transacción propia por lote y commit inmediato — mismo
+    `_write_batch_transaction()` que ya usa el restore. Si la conexión se
+    pierde a mitad, los batches ya commiteados quedan borrados tal cual;
+    relanzar el mismo comando reclasifica todo desde cero: los ya borrados
+    cuentan como `already_missing` (no-op), el resto se procesa con
+    normalidad, y el drift sigue protegido en cada intento.
+
+    Concurrencia con Pipeline A: no se introducen advisory locks ni
+    arquitectura distribuida — el `FOR UPDATE` de arriba ya cierra la
+    ventana real de corrupción, acotado siempre al batch en curso (nunca
+    197K filas a la vez). Como capa operativa adicional (defensa en
+    profundidad, no porque haga falta para la corrección): los candidatos
+    tienen `posted_at` >60 días y Pipeline A solo reingesta ofertas
+    recientes (`days=1`), así que en la práctica nunca debería colisionar;
+    aun así, se recomienda ejecutar `--delete` fuera de la franja del cron
+    de Pipeline A (evitar 05:30-07:00 UTC) y no lanzar Pipeline A
+    manualmente mientras dura la retención. No se automatiza — gate
+    operativo, no un lock adicional.
+
 Uso:
     python -m scripts.data_retention
     python -m scripts.data_retention --backup --dest "C:\\ruta\\TechRadar-data-backups"
     python -m scripts.data_retention --verify "C:\\ruta\\retention_.../manifest.json"
     python -m scripts.data_retention --restore-plan "C:\\ruta\\retention_.../manifest.json"
     python -m scripts.data_retention --restore "C:\\ruta\\retention_.../manifest.json" --confirm-restore
+    python -m scripts.data_retention --delete-plan "C:\\ruta\\retention_.../manifest.json"
+    python -m scripts.data_retention --delete "C:\\ruta\\retention_.../manifest.json" --confirm-delete
 """
 
 import argparse
@@ -127,6 +205,7 @@ logger = logging.getLogger("techradar.data_retention")
 RETENTION_DAYS_DEFAULT = 60
 ITERSIZE = 2000
 RESTORE_BATCH_SIZE_DEFAULT = 500  # mismo orden de magnitud que load.BATCH_SIZE
+DELETE_BATCH_SIZE_DEFAULT = 500  # mismo criterio conservador que el restore
 MAX_CONFLICT_SAMPLES = 50  # tope de diagnostico detallado, no de deteccion
 
 # Baseline esperado de columnas de `jobs`, verificado contra el catálogo real
@@ -219,11 +298,19 @@ JOB_SKILLS_COUNT_QUERY = """
 
 SKILLS_COUNT_QUERY = "SELECT COUNT(*) AS n FROM skills"
 
-# --- Restore: solo lectura -------------------------------------------------
+# --- Restore/delete-plan: solo lectura, SIN bloqueo -------------------------
 # {cols} se rellena igual que JOBS_QUERY_TEMPLATE, con columnas reales.
 JOBS_BY_IDS_TEMPLATE = "SELECT {cols} FROM jobs WHERE id = ANY(%s)"
 JOB_SKILLS_BY_JOB_IDS_QUERY = "SELECT job_id, skill_id FROM job_skills WHERE job_id = ANY(%s)"
 SKILLS_BY_IDS_QUERY = "SELECT id FROM skills WHERE id = ANY(%s)"
+
+# --- Delete REAL únicamente: SELECT ... FOR UPDATE, para cerrar el TOCTOU
+# entre clasificar y borrar (ver classify_jobs_batch(for_update=True) y
+# _process_jobs_delete). NUNCA usado por --delete-plan/--restore/--restore-plan
+# (todos SELECT normal, sin bloquear filas) -- verificado por
+# test_delete_plan_never_locks_rows_for_update /
+# test_restore_never_locks_rows_for_update.
+JOBS_BY_IDS_FOR_UPDATE_TEMPLATE = "SELECT {cols} FROM jobs WHERE id = ANY(%s) FOR UPDATE"
 
 # --- Restore: los DOS únicos INSERT del módulo, siempre ON CONFLICT DO
 # NOTHING -- ver test_insert_sql_is_confined_to_whitelisted_restore_constants
@@ -233,6 +320,16 @@ INSERT_JOBS_TEMPLATE = "INSERT INTO jobs ({cols}) VALUES %s ON CONFLICT (id) DO 
 INSERT_JOB_SKILLS_QUERY = (
     "INSERT INTO job_skills (job_id, skill_id) VALUES %s ON CONFLICT (job_id, skill_id) DO NOTHING"
 )
+
+# --- Delete: cuenta informativa de job_skills afectados por CASCADE ---------
+JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY = "SELECT COUNT(*) FROM job_skills WHERE job_id = ANY(%s)"
+
+# --- Delete: el ÚNICO DELETE del módulo. Solo apunta a `jobs` por `id`;
+# `job_skills.job_id → jobs.id ON DELETE CASCADE` (única FK real hacia
+# `jobs`) hace el resto -- nunca un DELETE manual de job_skills, `skills`
+# nunca se toca. Ver test_delete_sql_is_confined_to_whitelisted_constant y
+# test_delete_constant_only_targets_jobs_by_id en tests/test_data_retention.py.
+DELETE_JOBS_BY_IDS_QUERY = "DELETE FROM jobs WHERE id = ANY(%s)"
 
 
 class SchemaMismatchError(RuntimeError):
@@ -887,11 +984,31 @@ def verify_backup(manifest_path: Path) -> list[str]:
 # =============================================================================
 
 
-def classify_jobs_batch(cur, columns: list[str], batch_rows: list[dict]):
+def classify_jobs_batch(cur, columns: list[str], batch_rows: list[dict], *, for_update: bool = False):
     """
     Clasifica un batch de filas del backup (dicts ya canonicalizados, tal
     cual los devuelve `_read_jsonl_gz`) contra el estado ACTUAL de `jobs`.
-    Solo SELECT — no escribe nada.
+    Solo SELECT — no escribe nada por sí misma.
+
+    Compartida entre `--restore`/`--restore-plan` y `--delete`/
+    `--delete-plan`: "seguro para restaurar sin pisar nada" y "seguro para
+    borrar" son la MISMA comparación — no dos lógicas paralelas que puedan
+    divergir. El restore usa `insert_rows` (candidatos a INSERT) e
+    `identical_ids` (safe-existing); el delete usa `insert_rows` como
+    `already_missing` (ya no existe, nada que borrar) e `identical_ids`
+    como candidatos reales a DELETE. En ambos, `conflict_ids` NUNCA se toca.
+
+    `for_update=True` (usado EXCLUSIVAMENTE por el DELETE real,
+    `_process_jobs_delete(write=True)`) añade `FOR UPDATE` al SELECT:
+    bloquea las filas encontradas hasta que la transacción del batch
+    (`_write_batch_transaction`) haga COMMIT o ROLLBACK, cerrando el hueco
+    TOCTOU entre "comparar" y "borrar" — ninguna otra transacción puede
+    modificar esa fila entre esta lectura y el DELETE posterior en el
+    mismo batch/transacción; si lo intenta, se bloquea hasta que la
+    nuestra termine. `--restore`/`--restore-plan`/`--delete-plan` NUNCA
+    pasan `for_update=True` (no necesitan bloquear nada: no borran, y el
+    `INSERT ... ON CONFLICT DO NOTHING` del restore ya es seguro ante una
+    inserción concurrente por sí solo).
 
     Compara columna a columna reutilizando `_json_value()` (la misma
     canonicalización del export) sobre la fila real de Postgres, para que
@@ -907,7 +1024,8 @@ def classify_jobs_batch(cur, columns: list[str], batch_rows: list[dict]):
         muestra para diagnóstico; aquí nunca se trunca la detección).
     """
     ids = [row["id"] for row in batch_rows]
-    cur.execute(JOBS_BY_IDS_TEMPLATE.format(cols=", ".join(columns)), (ids,))
+    template = JOBS_BY_IDS_FOR_UPDATE_TEMPLATE if for_update else JOBS_BY_IDS_TEMPLATE
+    cur.execute(template.format(cols=", ".join(columns)), (ids,))
     live_by_id = {
         row[0]: {col: _json_value(v) for col, v in zip(columns, row)} for row in cur.fetchall()
     }
@@ -1180,6 +1298,173 @@ def print_restore_report(plan: dict, *, executed: bool) -> None:
 
 
 # =============================================================================
+# delete — autoridad exclusiva: candidate_ids/jobs de ESTE manifiesto,
+# nunca un recálculo de NOW() - retention_days
+# =============================================================================
+
+
+def _process_jobs_delete(conn, columns: list[str], jobs_path: Path, batch_size: int, *, write: bool):
+    """
+    Recorre el `jobs` del backup (== `candidate_ids`, ya verificado) en
+    batches y clasifica cada uno reutilizando `classify_jobs_batch()` — la
+    MISMA comparación que gobierna el restore:
+
+      - No existe hoy       → `already_missing`: no-op, nada que borrar
+        (relanzar tras un DELETE parcial cuenta estos como no-op, nunca
+        como error — idempotencia).
+      - Existe e idéntico al backup → candidato REAL a DELETE.
+      - Existe pero DISTINTO (drift) → NUNCA se borra; puede ser una
+        reingesta/actualización de Pipeline A posterior al backup.
+
+    Si `write=True`, borra (`DELETE FROM jobs WHERE id = ANY(%s)`) SOLO los
+    ids "identical" de cada batch, dentro de su propia transacción con
+    commit inmediato (`_write_batch_transaction`) — `job_skills.job_id →
+    jobs.id ON DELETE CASCADE` elimina sus vínculos automáticamente, sin
+    DELETE manual de `job_skills`. Si `write=False` (`--delete-plan`), solo
+    SELECT — ni siquiera cuenta con borrar.
+
+    TOCTOU cerrado con `FOR UPDATE`: solo en la rama `write=True` se llama
+    `classify_jobs_batch(..., for_update=True)` — bloquea las filas del
+    batch hasta el COMMIT/ROLLBACK de esa misma transacción, así que la
+    fila que se compara como "identical" es exactamente la misma que se
+    borra, sin ventana en la que otra transacción pueda modificarla entre
+    medias. `write=False` (`--delete-plan`) nunca bloquea nada.
+
+    El conteo de `job_skills` que se eliminarían/eliminaron por CASCADE se
+    mide ANTES del DELETE de cada batch (mismo cursor/transacción), para
+    que sea igual de fiable en modo plan que tras una ejecución real.
+    """
+    total = already_missing = deletable = drift = 0
+    drift_sample: list[dict] = []
+    job_skills_cascade = 0
+
+    for batch in _batched(_read_jsonl_gz(jobs_path), batch_size):
+        total += len(batch)
+        if write:
+            with _write_batch_transaction(conn):
+                with conn.cursor() as cur:
+                    missing_rows, identical_ids, batch_drift_ids, batch_drifts = (
+                        classify_jobs_batch(cur, columns, batch, for_update=True)
+                    )
+                    if identical_ids:
+                        cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(identical_ids),))
+                        job_skills_cascade += cur.fetchone()[0]
+                        cur.execute(DELETE_JOBS_BY_IDS_QUERY, (list(identical_ids),))
+        else:
+            with conn.cursor() as cur:
+                missing_rows, identical_ids, batch_drift_ids, batch_drifts = (
+                    classify_jobs_batch(cur, columns, batch)
+                )
+                if identical_ids:
+                    cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(identical_ids),))
+                    job_skills_cascade += cur.fetchone()[0]
+
+        already_missing += len(missing_rows)
+        deletable += len(identical_ids)
+        drift += len(batch_drift_ids)
+        room = MAX_CONFLICT_SAMPLES - len(drift_sample)
+        if room > 0:
+            drift_sample.extend(batch_drifts[:room])
+        logger.info(
+            "jobs: %d procesados (already_missing=%d deletable=%d drift=%d)",
+            total,
+            already_missing,
+            deletable,
+            drift,
+        )
+
+    return {
+        "total": total,
+        "already_missing": already_missing,
+        "deletable": deletable,
+        "drift": drift,
+        "drift_sample": drift_sample,
+        "job_skills_cascade": job_skills_cascade,
+    }
+
+
+def build_delete_plan(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
+    """
+    Modo READ-ONLY (`--delete-plan`): calcula exactamente qué borraría un
+    DELETE real usando los `candidate_ids`/`jobs` de ESTE manifiesto como
+    única autoridad — nunca recalcula `NOW() - retention_days`, nunca
+    busca "el backup más reciente". Una única transacción REPEATABLE READ
+    (`snapshot_transaction`), igual que dry-run/`--restore-plan`. Nunca usa
+    `conn.set_session(readonly=True)`.
+    """
+    columns = manifest["jobs_columns"]
+    jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
+
+    with snapshot_transaction(conn):
+        result = _process_jobs_delete(conn, columns, jobs_path, batch_size, write=False)
+
+    return {
+        "candidate_ids_total": result["total"],
+        "already_missing": result["already_missing"],
+        "existing_identical": result["deletable"],
+        "existing_different": result["drift"],
+        "drift_sample": result["drift_sample"],
+        "job_skills_cascade": result["job_skills_cascade"],
+    }
+
+
+def run_delete(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
+    """
+    DELETE REAL: `DELETE FROM jobs WHERE id = ANY(%s)`, batch a batch, cada
+    batch en su propia transacción con commit inmediato
+    (`_process_jobs_delete` / `_write_batch_transaction`) — mismo patrón
+    que `run_restore()`/`enrich_jobs()`. Solo borra candidatos existentes e
+    idénticos al backup; un candidato ya inexistente es no-op idempotente;
+    uno con drift NUNCA se borra. Clasifica con `FOR UPDATE` (bloqueo por
+    fila, acotado al batch): la fila que se compara como "identical" es
+    la MISMA que se borra, sin ventana en la que otra transacción pueda
+    modificarla entre medias. `ON DELETE CASCADE` en `job_skills.job_id`
+    elimina sus vínculos automáticamente — no hay DELETE manual de
+    `job_skills`, y `skills` nunca se toca.
+
+    Si se pierde la conexión a mitad, los batches ya commiteados quedan
+    borrados tal cual; relanzar el mismo comando reclasifica todo desde
+    cero — los ya borrados cuentan como `already_missing` (no-op), el
+    resto se procesa con normalidad, y el drift sigue protegido.
+    """
+    columns = manifest["jobs_columns"]
+    jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
+    result = _process_jobs_delete(conn, columns, jobs_path, batch_size, write=True)
+
+    return {
+        "candidate_ids_total": result["total"],
+        "already_missing": result["already_missing"],
+        "existing_identical": result["deletable"],
+        "existing_different": result["drift"],
+        "drift_sample": result["drift_sample"],
+        "job_skills_cascade": result["job_skills_cascade"],
+    }
+
+
+def print_delete_report(plan: dict, *, executed: bool) -> None:
+    """Formato compartido entre `--delete-plan` (hipotético) y `--delete` (ya ejecutado)."""
+    title = "DELETE — ejecutado" if executed else "DELETE-PLAN — READ-ONLY, nada borrado"
+    print("=" * 78)
+    print(f"{title} (data_retention.py)")
+    print("=" * 78)
+    print(f"candidate_ids del backup: {plan['candidate_ids_total']}")
+    print(f"  ya no existían (already_missing, no-op):        {plan['already_missing']}")
+    verbo = "borrados" if executed else "existentes e idénticos (candidatos reales a DELETE)"
+    print(f"  {verbo}: {plan['existing_identical']}")
+    print(f"  existentes pero DISTINTOS (drift, NUNCA borrados): {plan['existing_different']}")
+    verbo_js = "eliminados por CASCADE" if executed else "se eliminarían por CASCADE"
+    print(f"  job_skills {verbo_js}: {plan['job_skills_cascade']}")
+    if plan["drift_sample"]:
+        print(
+            f"Muestra de drift (hasta {MAX_CONFLICT_SAMPLES}, de {plan['existing_different']} totales):"
+        )
+        for c in plan["drift_sample"][:10]:
+            cols = [d[0] for d in c["diffs"]]
+            print(f"  job id={c['id']}: {len(c['diffs'])} columna(s) distinta(s) -> {cols}")
+    print("=" * 78)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1253,6 +1538,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=RESTORE_BATCH_SIZE_DEFAULT,
         help=f"Filas por batch/transacción en el restore (por defecto {RESTORE_BATCH_SIZE_DEFAULT}).",
+    )
+    parser.add_argument(
+        "--delete-plan",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help="READ-ONLY: calcula qué borraría un DELETE real (already_missing/deletable/"
+        "drift) usando los candidate_ids de este manifiesto como única autoridad — nunca "
+        "recalcula NOW()-retention_days. Solo SELECT.",
+    )
+    parser.add_argument(
+        "--delete",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help="Borra de jobs los candidatos de este backup que sigan existiendo e idénticos "
+        "(DELETE ... WHERE id = ANY(...), ON DELETE CASCADE elimina sus job_skills). Nunca "
+        "borra un job con drift respecto al backup. Requiere --confirm-delete explícito.",
+    )
+    parser.add_argument(
+        "--confirm-delete",
+        action="store_true",
+        help="Opt-in obligatorio para que --delete borre de verdad. Sin este flag, --delete "
+        "no hace nada — ni siquiera abre conexión a Supabase.",
+    )
+    parser.add_argument(
+        "--delete-batch-size",
+        type=int,
+        default=DELETE_BATCH_SIZE_DEFAULT,
+        help=f"Filas por batch/transacción en el delete (por defecto {DELETE_BATCH_SIZE_DEFAULT}).",
     )
     return parser
 
@@ -1337,6 +1652,43 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             conn.close()
         print_restore_report(result, executed=True)
+        return
+
+    if args.delete_plan and args.delete:
+        print("ERROR: usa --delete-plan o --delete, no ambos a la vez.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.delete_plan:
+        manifest_path = Path(args.delete_plan)
+        manifest = _load_verified_manifest(args.delete_plan, action_label="DELETE-PLAN")
+        if manifest is None:
+            sys.exit(1)
+        conn = _get_connection()
+        try:
+            plan = build_delete_plan(conn, manifest, manifest_path.parent, args.delete_batch_size)
+        finally:
+            conn.close()
+        print_delete_report(plan, executed=False)
+        return
+
+    if args.delete:
+        if not args.confirm_delete:
+            print(
+                "ERROR: --delete requiere --confirm-delete explícito. Sin él, no se abre "
+                "conexión a Supabase ni se borra nada. Usa --delete-plan para ver qué haría.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        manifest_path = Path(args.delete)
+        manifest = _load_verified_manifest(args.delete, action_label="DELETE")
+        if manifest is None:
+            sys.exit(1)
+        conn = _get_connection()
+        try:
+            result = run_delete(conn, manifest, manifest_path.parent, args.delete_batch_size)
+        finally:
+            conn.close()
+        print_delete_report(result, executed=True)
         return
 
     cutoff_override = _resolve_cutoff_override(args.cutoff)

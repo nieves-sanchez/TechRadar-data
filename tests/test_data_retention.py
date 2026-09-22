@@ -438,12 +438,28 @@ def test_atomic_backup_dir_clears_stale_incomplete_dir_before_starting(tmp_path)
 class _FakeRestoreDB:
     """Estado en memoria: jobs (dict id->dict de columnas), job_skills
     (set de pares) y skills (set de ids) -- suficiente para ejercitar la
-    logica real de clasificacion/batching/idempotencia sin Postgres."""
+    logica real de clasificacion/batching/idempotencia sin Postgres.
+
+    `fail_on_delete_call` (1-indexado) permite simular una desconexion a
+    mitad de un DELETE concreto, para probar que el batch en curso hace
+    rollback y los batches anteriores ya commiteados permanecen borrados.
+
+    `on_for_update_lock` (callback opcional, recibe el set de ids del
+    batch) se invoca exactamente cuando se ejecuta un SELECT ... FOR
+    UPDATE -- el instante en que Postgres bloquearia esas filas frente a
+    escritores concurrentes. Sirve para simular una escritura concurrente
+    justo en ese momento (ver test de TOCTOU) sin construir un simulador
+    de Postgres completo: el callback puede mutar `self.jobs` antes de que
+    el propio SELECT calcule su resultado, igual que ocurriria si Postgres
+    nos entregase la fila ya actualizada al conceder el lock."""
 
     def __init__(self, jobs=None, job_skills=None, skills=None):
         self.jobs: dict = {int(k): dict(v) for k, v in (jobs or {}).items()}
         self.job_skills: set = set(job_skills or set())
         self.skills: set = set(skills or set())
+        self.delete_calls = 0
+        self.fail_on_delete_call: int | None = None
+        self.on_for_update_lock = None
 
     def insert_job(self, row: dict) -> None:
         self.jobs.setdefault(row["id"], dict(row))  # ON CONFLICT (id) DO NOTHING
@@ -451,10 +467,17 @@ class _FakeRestoreDB:
     def insert_job_skill(self, pair) -> None:
         self.job_skills.add(tuple(pair))  # ON CONFLICT (job_id, skill_id) DO NOTHING
 
+    def delete_jobs(self, ids) -> None:
+        ids = set(ids)
+        for i in ids:
+            self.jobs.pop(i, None)
+        self.job_skills = {(j, s) for j, s in self.job_skills if j not in ids}  # ON DELETE CASCADE
+
 
 class _FakeRestoreCursor:
-    def __init__(self, db: _FakeRestoreDB):
+    def __init__(self, db: _FakeRestoreDB, conn=None):
         self.db = db
+        self.conn = conn
         self._result = []
 
     def __enter__(self):
@@ -466,9 +489,15 @@ class _FakeRestoreCursor:
     def execute(self, sql, params=None):
         if sql in (dr.SET_TIMEZONE_SQL, dr.SET_ISOLATION_SQL):
             self._result = []
-        elif " FROM jobs WHERE id = ANY" in sql:
-            cols = [c.strip() for c in sql[len("SELECT "): sql.index(" FROM jobs")].split(",")]
+        elif sql.startswith("SELECT") and " FROM jobs WHERE id = ANY" in sql:
             ids = params[0]
+            if sql.rstrip().endswith("FOR UPDATE") and self.db.on_for_update_lock is not None:
+                # Momento exacto en que Postgres concederia el lock: una
+                # escritura concurrente simulada aqui debe ser lo que
+                # veamos al "leer bajo bloqueo", no una version anterior.
+                self.db.on_for_update_lock(set(ids))
+            cols_part = sql[len("SELECT "): sql.index(" FROM jobs")]
+            cols = [c.strip() for c in cols_part.split(",")]
             self._result = [
                 tuple(self.db.jobs[i][c] for c in cols) for i in ids if i in self.db.jobs
             ]
@@ -478,6 +507,23 @@ class _FakeRestoreCursor:
         elif sql == dr.SKILLS_BY_IDS_QUERY:
             ids = set(params[0])
             self._result = [(sid,) for sid in ids if sid in self.db.skills]
+        elif sql == dr.JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY:
+            ids = set(params[0])
+            self._result = [(sum(1 for j, s in self.db.job_skills if j in ids),)]
+        elif sql == dr.DELETE_JOBS_BY_IDS_QUERY:
+            self.db.delete_calls += 1
+            if self.db.fail_on_delete_call == self.db.delete_calls:
+                raise RuntimeError("conexion perdida durante DELETE")
+            ids = set(params[0])
+            if self.conn is not None:
+                # Igual que Postgres real: no se aplica hasta el COMMIT de
+                # la transaccion del batch (ver _write_batch_transaction).
+                if self.conn._pending_delete_ids is None:
+                    self.conn._pending_delete_ids = set()
+                self.conn._pending_delete_ids |= ids
+            else:
+                self.db.delete_jobs(ids)
+            self._result = []
         else:
             raise AssertionError(f"query no soportada por el fake: {sql!r}")
 
@@ -494,15 +540,20 @@ class _FakeRestoreConn:
         self.autocommit = False
         self.commits = 0
         self.rollbacks = 0
+        self._pending_delete_ids: set | None = None
 
     def cursor(self, *a, **kw):
-        return _FakeRestoreCursor(self.db)
+        return _FakeRestoreCursor(self.db, self)
 
     def commit(self):
         self.commits += 1
+        if self._pending_delete_ids is not None:
+            self.db.delete_jobs(self._pending_delete_ids)
+        self._pending_delete_ids = None
 
     def rollback(self):
         self.rollbacks += 1
+        self._pending_delete_ids = None
 
 
 def _fake_execute_values(cur, sql, values, page_size=None):
@@ -938,6 +989,260 @@ def test_run_restore_batches_respect_restore_batch_size(tmp_path, patched_execut
 
 
 # =============================================================================
+# delete — autoridad exclusiva: candidate_ids/jobs del manifiesto, nunca un
+# recalculo de NOW()-retention_days. Reutiliza classify_jobs_batch (misma
+# comparacion que restore) y _write_batch_transaction (mismo patron de
+# batch+commit inmediato). Fakes: mismas limitaciones documentadas arriba
+# (sin PostgreSQL local accesible, sin contrasena conocida y sin intentar
+# averiguarla).
+# =============================================================================
+
+
+def test_build_delete_plan_classifies_missing_identical_drift_read_only(
+    tmp_path, patched_execute_values
+):
+    rows = [
+        (1, "Data Engineer", _TS.isoformat(), None, None),  # ya no existe -> already_missing
+        (2, "Backend", _TS.isoformat(), True, None),        # existe identico -> deletable
+        (3, "QA", _TS.isoformat(), False, None),             # existe distinto -> drift
+    ]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path,
+        jobs_rows=rows,
+        job_skills_rows=[(2, 10), (3, 11)],
+        skills_rows=[(10, "Python", "language"), (11, "SQL", "language")],
+    )
+    db = _FakeRestoreDB(
+        jobs={
+            2: dict(zip(RESTORE_COLUMNS, rows[1])),
+            3: dict(zip(RESTORE_COLUMNS, (3, "QA Senior", _TS.isoformat(), False, None))),
+        },
+        job_skills={(2, 10), (3, 11)},
+        skills={10, 11},
+    )
+    conn = _FakeRestoreConn(db)
+
+    plan = dr.build_delete_plan(conn, manifest, tmp_path, batch_size=500)
+
+    assert plan["candidate_ids_total"] == 3
+    assert plan["already_missing"] == 1
+    assert plan["existing_identical"] == 1
+    assert plan["existing_different"] == 1
+    assert plan["job_skills_cascade"] == 1  # solo el job_skill del deletable (job 2)
+    assert len(plan["drift_sample"]) == 1 and plan["drift_sample"][0]["id"] == 3
+    # READ-ONLY de verdad: nada debe haber cambiado en el fake
+    assert 2 in db.jobs and 3 in db.jobs
+    assert db.job_skills == {(2, 10), (3, 11)}
+
+
+def test_run_delete_deletes_only_identical_never_missing_never_drift(
+    tmp_path, patched_execute_values
+):
+    rows = [
+        (1, "Data Engineer", _TS.isoformat(), None, None),  # already_missing
+        (2, "Backend", _TS.isoformat(), True, None),        # deletable
+        (3, "QA", _TS.isoformat(), False, None),             # drift
+    ]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path,
+        jobs_rows=rows,
+        job_skills_rows=[(2, 10), (3, 11)],
+        skills_rows=[(10, "Python", "language"), (11, "SQL", "language")],
+    )
+    db = _FakeRestoreDB(
+        jobs={
+            2: dict(zip(RESTORE_COLUMNS, rows[1])),
+            3: dict(zip(RESTORE_COLUMNS, (3, "QA Senior", _TS.isoformat(), False, None))),
+        },
+        job_skills={(2, 10), (3, 11)},
+        skills={10, 11},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["already_missing"] == 1
+    assert result["existing_identical"] == 1
+    assert result["existing_different"] == 1
+    assert result["job_skills_cascade"] == 1
+    # el deletable (2) ya no existe; el drift (3) NUNCA se toca
+    assert 2 not in db.jobs
+    assert 3 in db.jobs
+    assert db.jobs[3]["title"] == "QA Senior"
+    # ON DELETE CASCADE: el job_skill del borrado desaparece, el del drift no
+    assert db.job_skills == {(3, 11)}
+
+
+def test_run_delete_already_missing_candidate_is_pure_noop(tmp_path, patched_execute_values):
+    rows = [(1, "Data Engineer", _TS.isoformat(), None, None)]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB()  # el job 1 nunca existio (o ya se borro antes)
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["already_missing"] == 1
+    assert result["existing_identical"] == 0
+    assert result["existing_different"] == 0
+    assert db.delete_calls == 0  # ni siquiera se intento un DELETE
+
+
+def test_run_delete_respects_delete_batch_size(tmp_path, patched_execute_values):
+    rows = [(i, f"Job {i}", _TS.isoformat(), None, None) for i in range(1, 8)]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB(jobs={i: dict(zip(RESTORE_COLUMNS, rows[i - 1])) for i in range(1, 8)})
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=2)  # 7 filas, batches de 2
+
+    assert result["existing_identical"] == 7
+    assert db.jobs == {}
+    assert db.delete_calls == 4  # ceil(7/2) batches con al menos un deletable
+
+
+def test_run_delete_is_idempotent_after_batch_failure(tmp_path, patched_execute_values):
+    """
+    Simula: batch 1 (job 1) se borra y hace commit; batch 2 (job 2) falla
+    a mitad del DELETE (conexion perdida) y hace rollback -- job 2 sigue
+    vivo. Se relanza `run_delete` desde cero: job 1 ahora es
+    `already_missing` (no-op), job 2 se borra sin error. Nunca se toca el
+    job 3, que tiene drift.
+    """
+    rows = [
+        (1, "Data Engineer", _TS.isoformat(), None, None),
+        (2, "Backend", _TS.isoformat(), None, None),
+        (3, "QA", _TS.isoformat(), False, None),
+    ]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB(
+        jobs={
+            1: dict(zip(RESTORE_COLUMNS, rows[0])),
+            2: dict(zip(RESTORE_COLUMNS, rows[1])),
+            3: dict(zip(RESTORE_COLUMNS, (3, "QA Senior", _TS.isoformat(), False, None))),
+        }
+    )
+    db.fail_on_delete_call = 2  # el DELETE del batch de job 2 revienta
+    conn = _FakeRestoreConn(db)
+
+    with pytest.raises(RuntimeError, match="conexion perdida"):
+        dr.run_delete(conn, manifest, tmp_path, batch_size=1)  # 3 batches de 1
+
+    assert conn.commits == 1  # batch de job 1
+    assert conn.rollbacks == 1  # batch de job 2
+    assert 1 not in db.jobs  # job 1 ya borrado y persistido
+    assert 2 in db.jobs  # job 2 sigue vivo -- el rollback lo protegio
+    assert 3 in db.jobs and db.jobs[3]["title"] == "QA Senior"  # drift, nunca tocado
+
+    # Relanzamos desde cero: sin errores, job 1 -> already_missing (no-op),
+    # job 2 se borra esta vez, job 3 sigue protegido.
+    result_2 = dr.run_delete(conn, manifest, tmp_path, batch_size=1)
+
+    assert result_2["already_missing"] == 1  # job 1
+    assert result_2["existing_identical"] == 1  # job 2
+    assert result_2["existing_different"] == 1  # job 3
+    assert db.jobs == {3: db.jobs[3]}  # solo el drift sigue vivo
+
+
+# --- TOCTOU: el DELETE real debe comparar y borrar la MISMA fila --------
+
+
+def test_run_delete_uses_for_update_and_never_deletes_a_row_changed_at_lock_time(
+    tmp_path, patched_execute_values
+):
+    """
+    Caso obligatorio de TOCTOU: el backup tiene la version antigua del
+    job 1, y `jobs` HOY todavia tiene esa misma version antigua (por eso
+    "parece" identical al arrancar el batch). Justo en el instante en que
+    el DELETE real ejecuta su SELECT ... FOR UPDATE -- el momento exacto
+    en que Postgres bloquearia esa fila frente a escritores concurrentes
+    -- simulamos que una escritura concurrente ya cambio la fila (p.ej.
+    una reingesta de Pipeline A). Sin FOR UPDATE (o si se comparase con
+    una lectura anterior en vez de con la fila recien bloqueada), el
+    codigo podria borrar silenciosamente la version nueva sin haberla
+    comparado nunca. Con FOR UPDATE, la comparacion usa la fila fresca en
+    el mismo instante del lock -> se detecta como drift y NUNCA se borra.
+    """
+    old_row = (1, "Data Engineer", _TS.isoformat(), None, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[old_row], job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB(jobs={1: dict(zip(RESTORE_COLUMNS, old_row))})
+
+    def concurrent_write(ids):
+        if 1 in ids:
+            db.jobs[1] = dict(
+                zip(RESTORE_COLUMNS, (1, "Data Engineer (reingestado)", _TS.isoformat(), None, None))
+            )
+
+    db.on_for_update_lock = concurrent_write
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["existing_identical"] == 0
+    assert result["existing_different"] == 1  # detectado como drift, no como identical
+    assert 1 in db.jobs  # NUNCA se borro
+    assert db.jobs[1]["title"] == "Data Engineer (reingestado)"  # version fresca, no la antigua
+
+
+def test_run_delete_locks_only_the_current_batch_ids_for_update(tmp_path, patched_execute_values):
+    """El DELETE real debe pedir el lock (FOR UPDATE) exactamente sobre
+    los ids del batch en curso -- nunca sobre las 197K filas a la vez."""
+    rows = [(i, f"Job {i}", _TS.isoformat(), None, None) for i in range(1, 4)]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB(jobs={i: dict(zip(RESTORE_COLUMNS, rows[i - 1])) for i in range(1, 4)})
+    locked_batches = []
+    db.on_for_update_lock = lambda ids: locked_batches.append(ids)
+    conn = _FakeRestoreConn(db)
+
+    dr.run_delete(conn, manifest, tmp_path, batch_size=1)
+
+    assert locked_batches == [{1}, {2}, {3}]  # un batch (1 id) por llamada, nunca los 3 juntos
+
+
+def test_delete_plan_never_locks_rows_for_update(tmp_path, patched_execute_values):
+    """--delete-plan sigue siendo SELECT normal, sin FOR UPDATE -- no
+    borra nada, asi que no hay nada que proteger con un lock."""
+    rows = [(1, "Data Engineer", _TS.isoformat(), None, None)]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[], skills_rows=[]
+    )
+    db = _FakeRestoreDB(jobs={1: dict(zip(RESTORE_COLUMNS, rows[0]))})
+    locked_batches = []
+    db.on_for_update_lock = lambda ids: locked_batches.append(ids)
+    conn = _FakeRestoreConn(db)
+
+    dr.build_delete_plan(conn, manifest, tmp_path, batch_size=500)
+
+    assert locked_batches == []
+
+
+def test_restore_never_locks_rows_for_update(tmp_path, patched_execute_values):
+    """El restore (INSERT ... ON CONFLICT DO NOTHING) tampoco necesita
+    FOR UPDATE -- solo el DELETE real bloquea filas."""
+    rows = [(1, "Data Engineer", _TS.isoformat(), None, None)]
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=rows, job_skills_rows=[(1, 10)], skills_rows=[(10, "Python", "language")]
+    )
+    db = _FakeRestoreDB(skills={10})
+    locked_batches = []
+    db.on_for_update_lock = lambda ids: locked_batches.append(ids)
+    conn = _FakeRestoreConn(db)
+
+    dr.run_restore(conn, manifest, tmp_path, batch_size=500)
+
+    assert locked_batches == []
+
+
+# =============================================================================
 # CLI — dry-run por defecto, backup requiere opt-in, verify no toca Supabase
 # =============================================================================
 
@@ -1100,19 +1405,113 @@ def test_cli_restore_aborted_error_propagates_with_no_partial_success_message(mo
 
 
 # =============================================================================
+# CLI — delete-plan / delete: ningun DELETE por defecto ni por accidente
+# =============================================================================
+
+
+def test_cli_delete_plan_and_delete_together_is_rejected(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path)
+
+    def _boom():
+        raise AssertionError("no deberia conectar si los flags son incompatibles")
+
+    monkeypatch.setattr(dr, "_get_connection", _boom)
+    with pytest.raises(SystemExit) as exc_info:
+        dr.main(["--delete-plan", str(manifest_path), "--delete", str(manifest_path)])
+    assert exc_info.value.code == 2
+
+
+def test_cli_delete_without_confirm_delete_never_connects(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path)
+
+    def _boom():
+        raise AssertionError("--delete sin --confirm-delete no debe abrir conexion")
+
+    monkeypatch.setattr(dr, "_get_connection", _boom)
+    monkeypatch.setattr(dr, "run_delete", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("run_delete no deberia llamarse")
+    ))
+    with pytest.raises(SystemExit) as exc_info:
+        dr.main(["--delete", str(manifest_path)])
+    assert exc_info.value.code == 2
+
+
+def test_cli_delete_plan_invalid_manifest_aborts_before_connecting(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path, drop_candidate_id=True)  # falla --verify
+
+    def _boom():
+        raise AssertionError("delete-plan no debe conectar si --verify falla")
+
+    monkeypatch.setattr(dr, "_get_connection", _boom)
+    with pytest.raises(SystemExit) as exc_info:
+        dr.main(["--delete-plan", str(manifest_path)])
+    assert exc_info.value.code == 1
+
+
+def test_cli_delete_confirmed_invalid_manifest_aborts_before_connecting(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path, corrupt_job_skills=True)  # falla --verify
+
+    def _boom():
+        raise AssertionError("--delete --confirm-delete no debe conectar si --verify falla")
+
+    monkeypatch.setattr(dr, "_get_connection", _boom)
+    with pytest.raises(SystemExit) as exc_info:
+        dr.main(["--delete", str(manifest_path), "--confirm-delete"])
+    assert exc_info.value.code == 1
+
+
+def test_cli_delete_plan_calls_build_delete_plan_not_run_delete(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path)
+    calls = []
+    monkeypatch.setattr(dr, "_get_connection", lambda: _FakeConn())
+    monkeypatch.setattr(dr, "build_delete_plan", lambda *a, **kw: calls.append("plan") or {
+        "candidate_ids_total": 0, "already_missing": 0, "existing_identical": 0,
+        "existing_different": 0, "drift_sample": [], "job_skills_cascade": 0,
+    })
+    monkeypatch.setattr(dr, "run_delete", lambda *a, **kw: calls.append("delete"))
+
+    dr.main(["--delete-plan", str(manifest_path)])
+
+    assert calls == ["plan"]
+
+
+def test_cli_delete_confirmed_calls_run_delete_not_plan(monkeypatch, tmp_path):
+    manifest_path = _build_tiny_backup(tmp_path)
+    calls = []
+    monkeypatch.setattr(dr, "_get_connection", lambda: _FakeConn())
+    monkeypatch.setattr(dr, "build_delete_plan", lambda *a, **kw: calls.append("plan"))
+    monkeypatch.setattr(dr, "run_delete", lambda *a, **kw: calls.append("delete") or {
+        "candidate_ids_total": 0, "already_missing": 0, "existing_identical": 0,
+        "existing_different": 0, "drift_sample": [], "job_skills_cascade": 0,
+    })
+
+    dr.main(["--delete", str(manifest_path), "--confirm-delete"])
+
+    assert calls == ["delete"]
+
+
+# =============================================================================
 # Seguridad — ninguna constante SQL del módulo contiene palabras prohibidas
 # =============================================================================
 #
-# INSERT ya NO está en esta lista desde que existe --restore: es una
-# operación legítima y deliberada (restaurar desde el backup), pero
-# CONFINADA exclusivamente a los dos constantes de ALLOWED_INSERT_CONSTANTS,
-# y SIEMPRE "ON CONFLICT ... DO NOTHING" (nunca "DO UPDATE", nunca podría
-# sobrescribir una fila existente) — ver los dos tests dedicados más abajo.
-# DELETE/UPDATE/ALTER/DROP/TRUNCATE/VACUUM/REINDEX/CLUSTER siguen
-# absolutamente prohibidos en todo el módulo, sin excepción.
+# INSERT ya NO está en esta lista desde que existe --restore, y DELETE ya
+# NO está desde que existe --delete: ambas son operaciones legítimas y
+# deliberadas, pero cada una CONFINADA exclusivamente a sus constantes de
+# ALLOWED_INSERT_CONSTANTS / ALLOWED_DELETE_CONSTANTS — ver los tests
+# dedicados más abajo. INSERT siempre "ON CONFLICT ... DO NOTHING" (nunca
+# "DO UPDATE"); el único DELETE apunta siempre a `jobs` por `id`, nunca a
+# `job_skills`/`skills` (`ON DELETE CASCADE` hace ese trabajo).
+# "UPDATE" a secas (una escritura real, ej. "UPDATE jobs SET ...") sigue
+# absolutamente prohibida, pero "FOR UPDATE" (cláusula de bloqueo de filas
+# de un SELECT, sin escribir nada) es legítima y está confinada a
+# JOBS_BY_IDS_FOR_UPDATE_TEMPLATE — ver test_for_update_lock_is_read_only_
+# and_confined_to_one_constant. El escaneo de abajo excluye "FOR UPDATE"
+# antes de buscar "UPDATE" a secas, precisamente para no perder esta red
+# de seguridad en el resto del módulo.
+# ALTER/DROP/TRUNCATE/VACUUM/REINDEX/CLUSTER siguen absolutamente
+# prohibidos en todo el módulo, sin excepción.
 
 FORBIDDEN_SQL_KEYWORDS = (
-    "DELETE",
     "UPDATE",
     "TRUNCATE",
     "ALTER",
@@ -1123,6 +1522,8 @@ FORBIDDEN_SQL_KEYWORDS = (
 )
 
 ALLOWED_INSERT_CONSTANTS = {"INSERT_JOBS_TEMPLATE", "INSERT_JOB_SKILLS_QUERY"}
+ALLOWED_DELETE_CONSTANTS = {"DELETE_JOBS_BY_IDS_QUERY"}
+FOR_UPDATE_LOCK_CONSTANT = "JOBS_BY_IDS_FOR_UPDATE_TEMPLATE"
 
 
 def _sql_constants():
@@ -1140,9 +1541,27 @@ def test_no_forbidden_keywords_in_sql_constants():
     # Si esto viene vacio, el propio test esta mal escrito (falso verde).
     assert len(sql_constants) >= 5
     for name, sql in sql_constants.items():
-        upper = sql.upper()
+        # "FOR UPDATE" (bloqueo de filas de un SELECT) no es la escritura
+        # "UPDATE" que este test prohibe -- se excluye antes de comparar.
+        upper = sql.upper().replace("FOR UPDATE", "")
         for kw in FORBIDDEN_SQL_KEYWORDS:
             assert kw not in upper, f"{name} contiene la palabra prohibida {kw!r}: {sql!r}"
+
+
+def test_for_update_lock_is_read_only_and_confined_to_one_constant():
+    """FOR UPDATE debe ser un SELECT de bloqueo (nunca una escritura real:
+    sin SET, sin DELETE/INSERT), y debe ser la UNICA constante SQL del
+    modulo que contiene la palabra UPDATE -- cualquier otra aparicion de
+    UPDATE seria una escritura real no auditada."""
+    sql = dr.JOBS_BY_IDS_FOR_UPDATE_TEMPLATE.upper()
+    assert sql.startswith("SELECT"), f"No es un SELECT: {sql!r}"
+    assert sql.rstrip().endswith("FOR UPDATE"), f"No termina en FOR UPDATE: {sql!r}"
+    assert " SET " not in sql
+
+    for name, value in _sql_constants().items():
+        if name == FOR_UPDATE_LOCK_CONSTANT:
+            continue
+        assert "UPDATE" not in value.upper(), f"{name} contiene UPDATE inesperado: {value!r}"
 
 
 def test_insert_sql_is_confined_to_whitelisted_restore_constants():
@@ -1170,13 +1589,35 @@ def test_insert_constants_are_always_on_conflict_do_nothing():
         assert "DO UPDATE" not in sql, f"{name} permite sobrescribir (DO UPDATE): {sql!r}"
 
 
+def test_delete_sql_is_confined_to_whitelisted_constant():
+    """DELETE solo puede aparecer en el unico constante del delete -- en
+    cualquier otra constante SQL séria una regresion grave (escritura
+    destructiva no prevista fuera del mecanismo de delete ya auditado)."""
+    for name, sql in _sql_constants().items():
+        if "DELETE" in sql.upper():
+            assert name in ALLOWED_DELETE_CONSTANTS, (
+                f"{name} contiene DELETE fuera de la lista blanca: {sql!r}"
+            )
+    assert ALLOWED_DELETE_CONSTANTS <= set(_sql_constants())
+
+
+def test_delete_constant_only_targets_jobs_by_id():
+    """El unico DELETE del modulo debe apuntar exclusivamente a `jobs` por
+    `id` -- nunca a `job_skills`/`skills` (ON DELETE CASCADE hace ese
+    trabajo) y nunca sin condicion WHERE (borraria la tabla entera)."""
+    sql = dr.DELETE_JOBS_BY_IDS_QUERY.upper()
+    assert sql.startswith("DELETE FROM JOBS"), f"No apunta a jobs: {sql!r}"
+    assert "WHERE ID = ANY" in sql, f"Sin condicion segura por id: {sql!r}"
+    assert "SKILLS" not in sql  # ni job_skills ni skills -- ON DELETE CASCADE hace ese trabajo
+
+
 def test_module_source_has_no_write_cursor_execute_calls():
     """
     Red de seguridad adicional: ninguna llamada real a cur.execute()/
     conn.commit() en el modulo debe coexistir con las palabras prohibidas
     en la MISMA linea (cubre el caso de que alguien construya SQL inline
-    en vez de en una constante con nombre). INSERT queda fuera de esta
-    lista por el mismo motivo que en el test anterior.
+    en vez de en una constante con nombre). INSERT y DELETE quedan fuera de
+    esta lista por el mismo motivo que en los tests anteriores.
     """
     source = Path(dr.__file__).read_text(encoding="utf-8")
     for lineno, line in enumerate(source.splitlines(), start=1):
