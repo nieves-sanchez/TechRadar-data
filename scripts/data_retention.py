@@ -114,23 +114,34 @@ un recálculo de `NOW() - 60 días` en el momento de borrar — evita drift
 temporal entre el snapshot que se decidió preservar y lo que realmente se
 borra):
     Reutiliza EXACTAMENTE `classify_jobs_batch()` — la misma comparación
-    fila a fila del restore, para que "seguro para borrar" y "seguro para
-    restaurar sin pisar nada" sean la misma definición, no dos lógicas
-    paralelas que puedan divergir:
+    fila a fila del restore, sin duplicarla — y refina cada conflicto con
+    `_is_benign_deactivation()` (exclusiva de esta ruta; el restore nunca
+    la llama):
       - No existe hoy       → `already_missing`, no-op (ya no está; puede
         ser un DELETE anterior ya aplicado — relanzar es idempotente).
-      - Existe e idéntico    → candidato REAL a DELETE.
-      - Existe pero DISTINTO → DRIFT: NUNCA se borra (protege una posible
-        reingesta/actualización de Pipeline A posterior al backup), se
+      - Existe e idéntico    → SAFE_IDENTICAL, candidato REAL a DELETE.
+      - Único diff `is_active` TRUE(backup)→FALSE(actual), las otras 22
+        columnas idénticas → SAFE_BENIGN_DEACTIVATION (auditoría
+        2026-09-22, PROJECT_MASTER_CONTEXT.md §102): también candidato
+        REAL a DELETE — es la única transición que
+        `_deactivate_old_jobs()` (`scripts/load.py`) puede producir, y la
+        produce sin tocar ninguna otra columna; por construcción no puede
+        ser una reingesta, actualización de contenido ni reactivación
+        (esas siempre tocan `last_seen_at` y ponen `is_active=TRUE`).
+      - Cualquier otro diff (`FALSE→TRUE`, NULL de por medio, o
+        `is_active` + otra columna) → MATERIAL_DRIFT: NUNCA se borra, se
         reporta columna a columna para revisión manual, igual que un
-        conflicto de restore.
+        conflicto de restore. **El restore/`--restore-plan` NUNCA aplican
+        esta excepción** — siguen exigiendo las 23 columnas idénticas sin
+        excepción; una fila `is_active TRUE→FALSE` sigue siendo CONFLICTO
+        para restore.
 
-    SQL: `DELETE FROM jobs WHERE id = ANY(%s)`, únicamente sobre los ids
-    `existing_identical` de cada batch. `job_skills.job_id → jobs.id ON
-    DELETE CASCADE` (única FK real hacia `jobs`, confirmada contra el
-    catálogo de PostgreSQL — PROJECT_MASTER_CONTEXT.md §96) elimina sus
-    vínculos automáticamente: no hay DELETE manual de `job_skills`, y
-    `skills` nunca se toca.
+    SQL: `DELETE FROM jobs WHERE id = ANY(%s)`, sobre la unión de ids
+    SAFE_IDENTICAL ∪ SAFE_BENIGN_DEACTIVATION de cada batch. `job_skills.
+    job_id → jobs.id ON DELETE CASCADE` (única FK real hacia `jobs`,
+    confirmada contra el catálogo de PostgreSQL — PROJECT_MASTER_CONTEXT.
+    md §96) elimina sus vínculos automáticamente: no hay DELETE manual de
+    `job_skills`, y `skills` nunca se toca.
 
     TOCTOU cerrado con `SELECT ... FOR UPDATE` (auditoría 2026-09-22, antes
     de autorizar el primer DELETE real): comparar y borrar ocurrían dentro
@@ -143,10 +154,15 @@ borra):
     COMMIT/ROLLBACK de esa transacción — cualquier escritura concurrente
     sobre esas filas queda bloqueada hasta entonces, y al liberarse ve la
     fila ya borrada (si se borró) o intacta (si era drift y nunca se
-    tocó). `--delete-plan`/`--restore`/`--restore-plan` NUNCA usan
-    `FOR UPDATE` — no borran nada, así que no hay nada que proteger; el
-    `INSERT ... ON CONFLICT DO NOTHING` del restore ya es seguro ante una
-    inserción concurrente por construcción, sin necesitar bloqueo.
+    tocó). La decisión SAFE_IDENTICAL/SAFE_BENIGN_DEACTIVATION/
+    MATERIAL_DRIFT se recalcula sobre la fila YA bloqueada, nunca sobre el
+    resultado de un `--delete-plan` anterior — si una fila que parecía
+    benign en el plan cambia de forma material justo antes de adquirir el
+    lock, se detecta ahí y no se borra. `--delete-plan`/`--restore`/
+    `--restore-plan` NUNCA usan `FOR UPDATE` — no borran nada, así que no
+    hay nada que proteger; el `INSERT ... ON CONFLICT DO NOTHING` del
+    restore ya es seguro ante una inserción concurrente por construcción,
+    sin necesitar bloqueo.
 
     Batches (`--delete-batch-size`, por defecto DELETE_BATCH_SIZE_DEFAULT)
     con transacción propia por lote y commit inmediato — mismo
@@ -1303,39 +1319,82 @@ def print_restore_report(plan: dict, *, executed: bool) -> None:
 # =============================================================================
 
 
+def _is_benign_deactivation(diffs: list[tuple]) -> bool:
+    """
+    True si el ÚNICO diff de un conflicto es `is_active` pasando de
+    `True` (backup) a `False` (actual) — la ÚNICA transición que
+    `_deactivate_old_jobs()` (`scripts/load.py`) puede producir, y la
+    produce SIN tocar ninguna otra columna (ni `last_seen_at`). Auditoría
+    2026-09-22: sobre 3.220 conflictos reales encontrados en un
+    `--delete-plan`, el 100% eran exactamente esta transición en solitario
+    — ver `notes/PROJECT_MASTER_CONTEXT.md` §102.
+
+    Por qué es seguro tratarla como no-drift SOLO para el DELETE de
+    retention: los dos únicos caminos de escritura de `load.py` tienen
+    huellas de columnas mutuamente excluyentes con esta transición.
+    `_upsert_jobs()` (reingesta/reactivación) SIEMPRE pone `is_active =
+    TRUE` y `last_seen_at = NOW()` en el mismo UPDATE — nunca puede dejar
+    `is_active = FALSE` con las otras 22 columnas intactas.
+    `_deactivate_old_jobs()` SOLO puede poner `is_active = FALSE` y nunca
+    toca ninguna otra columna. Por construcción, esta transición en
+    solitario no puede ser una reingesta, una actualización de contenido
+    real, ni una reactivación.
+
+    EXCLUSIVA del DELETE — NUNCA debe usarse para restore/`--restore-plan`,
+    que deben seguir exigiendo las 23 columnas idénticas sin excepción
+    (ver `_process_jobs_restore`, que nunca llama a esta función).
+    Cualquier otra combinación (NULL de por medio, `FALSE→TRUE`, o
+    `is_active` más cualquier otra columna) es `MATERIAL_DRIFT` y bloquea
+    el borrado igual que antes.
+    """
+    if len(diffs) != 1:
+        return False
+    col, backup_val, live_val = diffs[0]
+    return col == "is_active" and backup_val is True and live_val is False
+
+
 def _process_jobs_delete(conn, columns: list[str], jobs_path: Path, batch_size: int, *, write: bool):
     """
     Recorre el `jobs` del backup (== `candidate_ids`, ya verificado) en
     batches y clasifica cada uno reutilizando `classify_jobs_batch()` — la
-    MISMA comparación que gobierna el restore:
+    MISMA comparación que gobierna el restore, sin duplicar la lógica de
+    las 23 columnas — y refina cada conflicto con `_is_benign_deactivation()`
+    (exclusiva de esta función; el restore nunca la usa):
 
       - No existe hoy       → `already_missing`: no-op, nada que borrar
         (relanzar tras un DELETE parcial cuenta estos como no-op, nunca
         como error — idempotencia).
-      - Existe e idéntico al backup → candidato REAL a DELETE.
-      - Existe pero DISTINTO (drift) → NUNCA se borra; puede ser una
-        reingesta/actualización de Pipeline A posterior al backup.
+      - Existe e idéntico al backup → SAFE_IDENTICAL, candidato a DELETE.
+      - Existe, único diff `is_active` TRUE→FALSE → SAFE_BENIGN_DEACTIVATION,
+        candidato a DELETE igual que un idéntico (ver `_is_benign_deactivation`).
+      - Cualquier otro diff (incluida `FALSE→TRUE`, NULL de por medio, o
+        `is_active` + otra columna) → MATERIAL_DRIFT: NUNCA se borra.
 
-    Si `write=True`, borra (`DELETE FROM jobs WHERE id = ANY(%s)`) SOLO los
-    ids "identical" de cada batch, dentro de su propia transacción con
-    commit inmediato (`_write_batch_transaction`) — `job_skills.job_id →
-    jobs.id ON DELETE CASCADE` elimina sus vínculos automáticamente, sin
-    DELETE manual de `job_skills`. Si `write=False` (`--delete-plan`), solo
-    SELECT — ni siquiera cuenta con borrar.
+    `safe_ids` (identical ∪ benign) es el conjunto que realmente se borra
+    si `write=True` (`DELETE FROM jobs WHERE id = ANY(%s)`), dentro de su
+    propia transacción con commit inmediato (`_write_batch_transaction`) —
+    `job_skills.job_id → jobs.id ON DELETE CASCADE` elimina sus vínculos
+    automáticamente, sin DELETE manual de `job_skills`. Si `write=False`
+    (`--delete-plan`), solo SELECT — ni siquiera cuenta con borrar.
 
     TOCTOU cerrado con `FOR UPDATE`: solo en la rama `write=True` se llama
     `classify_jobs_batch(..., for_update=True)` — bloquea las filas del
-    batch hasta el COMMIT/ROLLBACK de esa misma transacción, así que la
-    fila que se compara como "identical" es exactamente la misma que se
-    borra, sin ventana en la que otra transacción pueda modificarla entre
-    medias. `write=False` (`--delete-plan`) nunca bloquea nada.
+    batch hasta el COMMIT/ROLLBACK de esa misma transacción, y la
+    clasificación (incluida la decisión benign/material) se recalcula
+    DESPUÉS de adquirir el lock, nunca reutilizando el resultado de un
+    `--delete-plan` previo. Si una fila que parecía benign cambia de forma
+    material justo al bloquearla, se detecta ahí mismo y no se borra;
+    igualmente si una fila cambia a benign justo al bloquearla, se borra
+    con la versión ya bloqueada. `write=False` (`--delete-plan`) nunca
+    bloquea nada.
 
     El conteo de `job_skills` que se eliminarían/eliminaron por CASCADE se
-    mide ANTES del DELETE de cada batch (mismo cursor/transacción), para
-    que sea igual de fiable en modo plan que tras una ejecución real.
+    mide ANTES del DELETE de cada batch (mismo cursor/transacción), sobre
+    `safe_ids` completo (identical + benign), para que sea igual de fiable
+    en modo plan que tras una ejecución real.
     """
-    total = already_missing = deletable = drift = 0
-    drift_sample: list[dict] = []
+    total = already_missing = deletable = benign = material = 0
+    drift_sample: list[dict] = []  # SOLO material_drift -- los benign no necesitan diagnóstico
     job_skills_cascade = 0
 
     for batch in _batched(_read_jsonl_gz(jobs_path), batch_size):
@@ -1343,43 +1402,66 @@ def _process_jobs_delete(conn, columns: list[str], jobs_path: Path, batch_size: 
         if write:
             with _write_batch_transaction(conn):
                 with conn.cursor() as cur:
-                    missing_rows, identical_ids, batch_drift_ids, batch_drifts = (
-                        classify_jobs_batch(cur, columns, batch, for_update=True)
+                    missing_rows, identical_ids, conflict_ids, conflicts = classify_jobs_batch(
+                        cur, columns, batch, for_update=True
                     )
-                    if identical_ids:
-                        cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(identical_ids),))
+                    benign_ids = {c["id"] for c in conflicts if _is_benign_deactivation(c["diffs"])}
+                    material_conflicts = [c for c in conflicts if c["id"] not in benign_ids]
+                    safe_ids = identical_ids | benign_ids
+                    if safe_ids:
+                        cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(safe_ids),))
                         job_skills_cascade += cur.fetchone()[0]
-                        cur.execute(DELETE_JOBS_BY_IDS_QUERY, (list(identical_ids),))
+                        cur.execute(DELETE_JOBS_BY_IDS_QUERY, (list(safe_ids),))
         else:
             with conn.cursor() as cur:
-                missing_rows, identical_ids, batch_drift_ids, batch_drifts = (
-                    classify_jobs_batch(cur, columns, batch)
+                missing_rows, identical_ids, conflict_ids, conflicts = classify_jobs_batch(
+                    cur, columns, batch
                 )
-                if identical_ids:
-                    cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(identical_ids),))
+                benign_ids = {c["id"] for c in conflicts if _is_benign_deactivation(c["diffs"])}
+                material_conflicts = [c for c in conflicts if c["id"] not in benign_ids]
+                safe_ids = identical_ids | benign_ids
+                if safe_ids:
+                    cur.execute(JOB_SKILLS_COUNT_BY_JOB_IDS_QUERY, (list(safe_ids),))
                     job_skills_cascade += cur.fetchone()[0]
 
         already_missing += len(missing_rows)
         deletable += len(identical_ids)
-        drift += len(batch_drift_ids)
+        benign += len(benign_ids)
+        material += len(material_conflicts)
         room = MAX_CONFLICT_SAMPLES - len(drift_sample)
         if room > 0:
-            drift_sample.extend(batch_drifts[:room])
+            drift_sample.extend(material_conflicts[:room])
         logger.info(
-            "jobs: %d procesados (already_missing=%d deletable=%d drift=%d)",
+            "jobs: %d procesados (already_missing=%d identical=%d benign=%d material_drift=%d)",
             total,
             already_missing,
             deletable,
-            drift,
+            benign,
+            material,
         )
 
     return {
         "total": total,
         "already_missing": already_missing,
         "deletable": deletable,
-        "drift": drift,
+        "benign_deactivation": benign,
+        "material_drift": material,
         "drift_sample": drift_sample,
         "job_skills_cascade": job_skills_cascade,
+    }
+
+
+def _delete_plan_dict(result: dict) -> dict:
+    """Forma de salida compartida entre build_delete_plan() y run_delete()."""
+    return {
+        "candidate_ids_total": result["total"],
+        "already_missing": result["already_missing"],
+        "existing_identical": result["deletable"],
+        "benign_deactivation": result["benign_deactivation"],
+        "material_drift": result["material_drift"],
+        "safe_delete_total": result["deletable"] + result["benign_deactivation"],
+        "drift_sample": result["drift_sample"],
+        "job_skills_cascade": result["job_skills_cascade"],
     }
 
 
@@ -1390,7 +1472,7 @@ def build_delete_plan(conn, manifest: dict, backup_dir: Path, batch_size: int) -
     única autoridad — nunca recalcula `NOW() - retention_days`, nunca
     busca "el backup más reciente". Una única transacción REPEATABLE READ
     (`snapshot_transaction`), igual que dry-run/`--restore-plan`. Nunca usa
-    `conn.set_session(readonly=True)`.
+    `conn.set_session(readonly=True)`, nunca `FOR UPDATE`.
     """
     columns = manifest["jobs_columns"]
     jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
@@ -1398,14 +1480,7 @@ def build_delete_plan(conn, manifest: dict, backup_dir: Path, batch_size: int) -
     with snapshot_transaction(conn):
         result = _process_jobs_delete(conn, columns, jobs_path, batch_size, write=False)
 
-    return {
-        "candidate_ids_total": result["total"],
-        "already_missing": result["already_missing"],
-        "existing_identical": result["deletable"],
-        "existing_different": result["drift"],
-        "drift_sample": result["drift_sample"],
-        "job_skills_cascade": result["job_skills_cascade"],
-    }
+    return _delete_plan_dict(result)
 
 
 def run_delete(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
@@ -1413,32 +1488,26 @@ def run_delete(conn, manifest: dict, backup_dir: Path, batch_size: int) -> dict:
     DELETE REAL: `DELETE FROM jobs WHERE id = ANY(%s)`, batch a batch, cada
     batch en su propia transacción con commit inmediato
     (`_process_jobs_delete` / `_write_batch_transaction`) — mismo patrón
-    que `run_restore()`/`enrich_jobs()`. Solo borra candidatos existentes e
-    idénticos al backup; un candidato ya inexistente es no-op idempotente;
-    uno con drift NUNCA se borra. Clasifica con `FOR UPDATE` (bloqueo por
-    fila, acotado al batch): la fila que se compara como "identical" es
-    la MISMA que se borra, sin ventana en la que otra transacción pueda
-    modificarla entre medias. `ON DELETE CASCADE` en `job_skills.job_id`
-    elimina sus vínculos automáticamente — no hay DELETE manual de
-    `job_skills`, y `skills` nunca se toca.
+    que `run_restore()`/`enrich_jobs()`. Borra candidatos SAFE_IDENTICAL y
+    SAFE_BENIGN_DEACTIVATION (ver `_is_benign_deactivation`); un candidato
+    ya inexistente es no-op idempotente; cualquier MATERIAL_DRIFT NUNCA se
+    borra. Clasifica con `FOR UPDATE` (bloqueo por fila, acotado al
+    batch): la fila que se compara es la MISMA que se borra, sin ventana
+    en la que otra transacción pueda modificarla entre medias — la
+    clasificación benign/material se recalcula sobre la fila ya
+    bloqueada, nunca sobre un `--delete-plan` previo. `ON DELETE CASCADE`
+    en `job_skills.job_id` elimina sus vínculos automáticamente — no hay
+    DELETE manual de `job_skills`, y `skills` nunca se toca.
 
     Si se pierde la conexión a mitad, los batches ya commiteados quedan
     borrados tal cual; relanzar el mismo comando reclasifica todo desde
     cero — los ya borrados cuentan como `already_missing` (no-op), el
-    resto se procesa con normalidad, y el drift sigue protegido.
+    resto se procesa con normalidad, y el material_drift sigue protegido.
     """
     columns = manifest["jobs_columns"]
     jobs_path = _backup_file_path(backup_dir, manifest, "jobs")
     result = _process_jobs_delete(conn, columns, jobs_path, batch_size, write=True)
-
-    return {
-        "candidate_ids_total": result["total"],
-        "already_missing": result["already_missing"],
-        "existing_identical": result["deletable"],
-        "existing_different": result["drift"],
-        "drift_sample": result["drift_sample"],
-        "job_skills_cascade": result["job_skills_cascade"],
-    }
+    return _delete_plan_dict(result)
 
 
 def print_delete_report(plan: dict, *, executed: bool) -> None:
@@ -1449,14 +1518,20 @@ def print_delete_report(plan: dict, *, executed: bool) -> None:
     print("=" * 78)
     print(f"candidate_ids del backup: {plan['candidate_ids_total']}")
     print(f"  ya no existían (already_missing, no-op):        {plan['already_missing']}")
-    verbo = "borrados" if executed else "existentes e idénticos (candidatos reales a DELETE)"
-    print(f"  {verbo}: {plan['existing_identical']}")
-    print(f"  existentes pero DISTINTOS (drift, NUNCA borrados): {plan['existing_different']}")
+    verbo = "borrados" if executed else "candidatos seguros"
+    print(f"  existentes e idénticos (SAFE_IDENTICAL), {verbo}: {plan['existing_identical']}")
+    print(
+        f"  is_active TRUE->FALSE, resto idéntico (SAFE_BENIGN_DEACTIVATION), {verbo}: "
+        f"{plan['benign_deactivation']}"
+    )
+    print(f"  TOTAL seguro para borrar (identical + benign): {plan['safe_delete_total']}")
+    print(f"  MATERIAL DRIFT (NUNCA borrados): {plan['material_drift']}")
     verbo_js = "eliminados por CASCADE" if executed else "se eliminarían por CASCADE"
     print(f"  job_skills {verbo_js}: {plan['job_skills_cascade']}")
     if plan["drift_sample"]:
         print(
-            f"Muestra de drift (hasta {MAX_CONFLICT_SAMPLES}, de {plan['existing_different']} totales):"
+            f"Muestra de MATERIAL DRIFT (hasta {MAX_CONFLICT_SAMPLES}, de "
+            f"{plan['material_drift']} totales):"
         )
         for c in plan["drift_sample"][:10]:
             cols = [d[0] for d in c["diffs"]]

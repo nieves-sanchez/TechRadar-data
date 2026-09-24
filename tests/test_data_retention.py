@@ -803,13 +803,17 @@ def test_process_job_skills_restore_never_inserts_duplicate(tmp_path, patched_ex
 # --- run_restore / build_restore_plan: orquestacion end-to-end ----------
 
 
-def _write_tiny_restore_backup(tmp_path, *, jobs_rows, job_skills_rows, skills_rows):
+def _write_tiny_restore_backup(tmp_path, *, jobs_rows, job_skills_rows, skills_rows, columns=None):
+    """`columns` por defecto RESTORE_COLUMNS (compatibilidad con los tests
+    existentes); los tests de SAFE_BENIGN_DEACTIVATION pasan DELETE_COLUMNS
+    (incluye `is_active`, que RESTORE_COLUMNS no tiene)."""
+    columns = columns or RESTORE_COLUMNS
     jobs_path = tmp_path / "jobs.jsonl.gz"
     job_skills_path = tmp_path / "job_skills.jsonl.gz"
     skills_path = tmp_path / "skills_snapshot.jsonl.gz"
     candidate_ids_path = tmp_path / "candidate_ids.jsonl.gz"
 
-    jobs_result = dr.export_rows_to_jsonl_gz(jobs_rows, RESTORE_COLUMNS, jobs_path)
+    jobs_result = dr.export_rows_to_jsonl_gz(jobs_rows, columns, jobs_path)
     job_skills_result = dr.export_rows_to_jsonl_gz(job_skills_rows, dr.JOB_SKILLS_COLUMNS, job_skills_path)
     skills_result = dr.export_rows_to_jsonl_gz(skills_rows, dr.SKILLS_COLUMNS, skills_path)
     candidate_rows = [(row[0],) for row in jobs_rows]
@@ -817,7 +821,7 @@ def _write_tiny_restore_backup(tmp_path, *, jobs_rows, job_skills_rows, skills_r
 
     manifest = {
         "format_version": "1.0",
-        "jobs_columns": RESTORE_COLUMNS,
+        "jobs_columns": columns,
         "jobs_count": jobs_result["count"],
         "job_skills_count": job_skills_result["count"],
         "skills_count": skills_result["count"],
@@ -1027,7 +1031,9 @@ def test_build_delete_plan_classifies_missing_identical_drift_read_only(
     assert plan["candidate_ids_total"] == 3
     assert plan["already_missing"] == 1
     assert plan["existing_identical"] == 1
-    assert plan["existing_different"] == 1
+    assert plan["benign_deactivation"] == 0  # el drift es en "title", no is_active
+    assert plan["material_drift"] == 1
+    assert plan["safe_delete_total"] == 1
     assert plan["job_skills_cascade"] == 1  # solo el job_skill del deletable (job 2)
     assert len(plan["drift_sample"]) == 1 and plan["drift_sample"][0]["id"] == 3
     # READ-ONLY de verdad: nada debe haber cambiado en el fake
@@ -1063,7 +1069,9 @@ def test_run_delete_deletes_only_identical_never_missing_never_drift(
 
     assert result["already_missing"] == 1
     assert result["existing_identical"] == 1
-    assert result["existing_different"] == 1
+    assert result["benign_deactivation"] == 0  # el drift es en "title", no is_active
+    assert result["material_drift"] == 1
+    assert result["safe_delete_total"] == 1
     assert result["job_skills_cascade"] == 1
     # el deletable (2) ya no existe; el drift (3) NUNCA se toca
     assert 2 not in db.jobs
@@ -1085,7 +1093,8 @@ def test_run_delete_already_missing_candidate_is_pure_noop(tmp_path, patched_exe
 
     assert result["already_missing"] == 1
     assert result["existing_identical"] == 0
-    assert result["existing_different"] == 0
+    assert result["benign_deactivation"] == 0
+    assert result["material_drift"] == 0
     assert db.delete_calls == 0  # ni siquiera se intento un DELETE
 
 
@@ -1145,7 +1154,7 @@ def test_run_delete_is_idempotent_after_batch_failure(tmp_path, patched_execute_
 
     assert result_2["already_missing"] == 1  # job 1
     assert result_2["existing_identical"] == 1  # job 2
-    assert result_2["existing_different"] == 1  # job 3
+    assert result_2["material_drift"] == 1  # job 3
     assert db.jobs == {3: db.jobs[3]}  # solo el drift sigue vivo
 
 
@@ -1186,7 +1195,7 @@ def test_run_delete_uses_for_update_and_never_deletes_a_row_changed_at_lock_time
     result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
 
     assert result["existing_identical"] == 0
-    assert result["existing_different"] == 1  # detectado como drift, no como identical
+    assert result["material_drift"] == 1  # detectado como drift, no como identical
     assert 1 in db.jobs  # NUNCA se borro
     assert db.jobs[1]["title"] == "Data Engineer (reingestado)"  # version fresca, no la antigua
 
@@ -1240,6 +1249,286 @@ def test_restore_never_locks_rows_for_update(tmp_path, patched_execute_values):
     dr.run_restore(conn, manifest, tmp_path, batch_size=500)
 
     assert locked_batches == []
+
+
+# =============================================================================
+# SAFE_BENIGN_DEACTIVATION — is_active TRUE->FALSE en solitario, exclusiva
+# del DELETE de retention. Auditoria 2026-09-22: 3.220 conflictos reales de
+# un --delete-plan eran 100% esta transicion, explicada por
+# _deactivate_old_jobs() (scripts/load.py), que SOLO modifica is_active.
+# Restore/--restore-plan NUNCA aplican esta excepcion -- columnas propias
+# (DELETE_COLUMNS, con is_active) para no tocar RESTORE_COLUMNS ni ninguno
+# de los tests que ya lo usan.
+# =============================================================================
+
+DELETE_COLUMNS = ["id", "title", "posted_at", "is_active", "description_full"]
+
+
+# --- _is_benign_deactivation: funcion pura, sin BD -----------------------
+
+
+def test_is_benign_deactivation_true_to_false_only():
+    assert dr._is_benign_deactivation([("is_active", True, False)]) is True
+
+
+def test_is_benign_deactivation_false_to_true_is_material():
+    assert dr._is_benign_deactivation([("is_active", False, True)]) is False
+
+
+def test_is_benign_deactivation_with_extra_column_diff_is_material():
+    assert dr._is_benign_deactivation(
+        [("is_active", True, False), ("title", "A", "B")]
+    ) is False
+
+
+def test_is_benign_deactivation_null_transitions_are_material():
+    assert dr._is_benign_deactivation([("is_active", None, False)]) is False
+    assert dr._is_benign_deactivation([("is_active", True, None)]) is False
+    assert dr._is_benign_deactivation([("is_active", None, True)]) is False
+
+
+def test_is_benign_deactivation_other_column_only_is_material():
+    assert dr._is_benign_deactivation([("title", "Data Engineer", "Senior Data Engineer")]) is False
+
+
+def test_is_benign_deactivation_no_diffs_is_material():
+    assert dr._is_benign_deactivation([]) is False
+
+
+# --- DELETE: los 6 casos de clasificacion pedidos -------------------------
+
+
+def test_run_delete_case1_true_to_false_only_is_benign_and_deleted(tmp_path, patched_execute_values):
+    """Caso 1: backup TRUE, actual FALSE, resto identico -> benign, se borra."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[(1, 10)],
+        skills_rows=[(10, "Python", "language")], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))},
+        job_skills={(1, 10)},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["existing_identical"] == 0
+    assert result["benign_deactivation"] == 1
+    assert result["material_drift"] == 0
+    assert result["safe_delete_total"] == 1
+    assert 1 not in db.jobs  # se borro
+    assert db.job_skills == set()  # cascade
+
+
+def test_run_delete_case2_false_to_true_is_material_never_deleted(tmp_path, patched_execute_values):
+    """Caso 2: backup FALSE, actual TRUE -> material drift, NUNCA se borra
+    (posible reactivacion real via UPSERT)."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), False, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), True, None)))},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["benign_deactivation"] == 0
+    assert result["material_drift"] == 1
+    assert result["safe_delete_total"] == 0
+    assert 1 in db.jobs  # nunca se borro
+
+
+def test_run_delete_case3_true_to_false_plus_other_column_is_material(tmp_path, patched_execute_values):
+    """Caso 3: is_active TRUE->FALSE PERO ademas cambia otra columna -> material drift."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Senior Data Engineer", _TS.isoformat(), False, None)))},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["benign_deactivation"] == 0
+    assert result["material_drift"] == 1
+    assert 1 in db.jobs
+
+
+def test_run_delete_case4_null_is_active_transition_is_material(tmp_path, patched_execute_values):
+    """Caso 4: NULL de por medio en is_active -> material drift, nunca benign."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), None, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["benign_deactivation"] == 0
+    assert result["material_drift"] == 1
+    assert 1 in db.jobs
+
+
+def test_run_delete_case5_identical_is_safe_identical_not_benign(tmp_path, patched_execute_values):
+    """Caso 5: fila identica normal -> existing_identical, no benign_deactivation."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(jobs={1: dict(zip(DELETE_COLUMNS, backup_row))})
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["existing_identical"] == 1
+    assert result["benign_deactivation"] == 0
+    assert result["safe_delete_total"] == 1
+    assert 1 not in db.jobs
+
+
+def test_run_delete_case6_other_column_diff_with_is_active_equal_is_material(
+    tmp_path, patched_execute_values
+):
+    """Caso 6: is_active igual en ambos lados, pero otra columna distinta -> material drift."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), True, "texto nuevo")))},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["benign_deactivation"] == 0
+    assert result["material_drift"] == 1
+    assert 1 in db.jobs
+
+
+# --- RESTORE: sigue estricto, nunca aplica la excepcion -------------------
+
+
+def test_case7_restore_still_treats_true_to_false_only_as_conflict(tmp_path, patched_execute_values):
+    """Caso 7: RESTORE debe seguir tratando TRUE->FALSE-only como CONFLICTO
+    estricto -- la excepcion de benign deactivation es exclusiva del DELETE."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[(1, 10)],
+        skills_rows=[(10, "Python", "language")], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))},
+        skills={10},
+    )
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_restore(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["jobs_conflict"] == 1  # sigue siendo conflicto, no "identical"
+    assert result["jobs_identical"] == 0
+    assert db.jobs[1]["is_active"] is False  # nunca se toca
+    assert db.job_skills == set()  # bloqueados por conflicto, nunca restaurados
+
+
+def test_case8_restore_plan_also_treats_true_to_false_only_as_conflict(tmp_path, patched_execute_values):
+    """Caso 8: --restore-plan tampoco aplica la excepcion de benign deactivation."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))},
+    )
+    conn = _FakeRestoreConn(db)
+
+    plan = dr.build_restore_plan(conn, manifest, tmp_path, batch_size=500)
+
+    assert plan["jobs_conflict"] == 1
+    assert plan["jobs_identical"] == 0
+
+
+# --- TOCTOU/destructivo con la nueva clasificacion -------------------------
+
+
+def test_case9_delete_locks_and_deletes_row_that_becomes_benign_at_lock_time(
+    tmp_path, patched_execute_values
+):
+    """Caso 9: la fila es identical al arrancar el batch, pero justo en el
+    instante del FOR UPDATE una escritura concurrente (simulada) la
+    desactiva (TRUE->FALSE). Sigue siendo benign -> se borra igual."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(jobs={1: dict(zip(DELETE_COLUMNS, backup_row))})  # TRUE, "identical" al arrancar
+
+    def concurrent_deactivation(ids):
+        if 1 in ids:
+            db.jobs[1] = dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))
+
+    db.on_for_update_lock = concurrent_deactivation
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["benign_deactivation"] == 1
+    assert 1 not in db.jobs  # se borro: la version bloqueada era benign
+
+
+def test_case10_delete_locks_and_protects_row_that_becomes_material_at_lock_time(
+    tmp_path, patched_execute_values
+):
+    """Caso 10: la fila parecia identical al leer el backup, pero justo en
+    el instante del FOR UPDATE cambia de forma NO benigna (otra columna).
+    NUNCA se borra."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(jobs={1: dict(zip(DELETE_COLUMNS, backup_row))})
+
+    def concurrent_material_change(ids):
+        if 1 in ids:
+            db.jobs[1] = dict(
+                zip(DELETE_COLUMNS, (1, "Senior Data Engineer", _TS.isoformat(), True, None))
+            )
+
+    db.on_for_update_lock = concurrent_material_change
+    conn = _FakeRestoreConn(db)
+
+    result = dr.run_delete(conn, manifest, tmp_path, batch_size=500)
+
+    assert result["material_drift"] == 1
+    assert 1 in db.jobs  # protegido
+
+
+def test_case11_delete_plan_still_never_locks_with_benign_logic(tmp_path, patched_execute_values):
+    """Caso 11: --delete-plan sigue siendo READ-ONLY puro (sin FOR UPDATE)
+    incluso con la nueva clasificacion benign/material."""
+    backup_row = (1, "Data Engineer", _TS.isoformat(), True, None)
+    manifest, manifest_path = _write_tiny_restore_backup(
+        tmp_path, jobs_rows=[backup_row], job_skills_rows=[], skills_rows=[], columns=DELETE_COLUMNS,
+    )
+    db = _FakeRestoreDB(
+        jobs={1: dict(zip(DELETE_COLUMNS, (1, "Data Engineer", _TS.isoformat(), False, None)))}
+    )
+    locked_batches = []
+    db.on_for_update_lock = lambda ids: locked_batches.append(ids)
+    conn = _FakeRestoreConn(db)
+
+    plan = dr.build_delete_plan(conn, manifest, tmp_path, batch_size=500)
+
+    assert locked_batches == []
+    assert plan["benign_deactivation"] == 1  # clasifica correctamente sin bloquear
 
 
 # =============================================================================
@@ -1466,7 +1755,8 @@ def test_cli_delete_plan_calls_build_delete_plan_not_run_delete(monkeypatch, tmp
     monkeypatch.setattr(dr, "_get_connection", lambda: _FakeConn())
     monkeypatch.setattr(dr, "build_delete_plan", lambda *a, **kw: calls.append("plan") or {
         "candidate_ids_total": 0, "already_missing": 0, "existing_identical": 0,
-        "existing_different": 0, "drift_sample": [], "job_skills_cascade": 0,
+        "benign_deactivation": 0, "material_drift": 0, "safe_delete_total": 0,
+        "drift_sample": [], "job_skills_cascade": 0,
     })
     monkeypatch.setattr(dr, "run_delete", lambda *a, **kw: calls.append("delete"))
 
@@ -1482,7 +1772,8 @@ def test_cli_delete_confirmed_calls_run_delete_not_plan(monkeypatch, tmp_path):
     monkeypatch.setattr(dr, "build_delete_plan", lambda *a, **kw: calls.append("plan"))
     monkeypatch.setattr(dr, "run_delete", lambda *a, **kw: calls.append("delete") or {
         "candidate_ids_total": 0, "already_missing": 0, "existing_identical": 0,
-        "existing_different": 0, "drift_sample": [], "job_skills_cascade": 0,
+        "benign_deactivation": 0, "material_drift": 0, "safe_delete_total": 0,
+        "drift_sample": [], "job_skills_cascade": 0,
     })
 
     dr.main(["--delete", str(manifest_path), "--confirm-delete"])
